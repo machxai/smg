@@ -8,7 +8,8 @@ use openai_protocol::{
 };
 use smg_grpc_client::{
     common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, MlxEngineClient,
-    SglangSchedulerClient, TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
+    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    TrtllmServiceClient, VllmEngineClient,
 };
 
 use crate::routers::grpc::{
@@ -39,6 +40,13 @@ pub enum GrpcClient {
     Trtllm(TrtllmServiceClient),
     Mlx(MlxEngineClient),
     TokenSpeed(TokenSpeedSchedulerClient),
+}
+
+#[derive(Default)]
+pub struct GenerateRequestBuildOptions {
+    pub multimodal_inputs: Option<MultimodalData>,
+    pub tool_constraints: Option<(String, String)>,
+    pub require_reasoning: bool,
 }
 
 impl GrpcClient {
@@ -445,12 +453,11 @@ impl GrpcClient {
         body: &ChatCompletionRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        multimodal_inputs: Option<MultimodalData>,
-        tool_constraints: Option<(String, String)>,
+        options: GenerateRequestBuildOptions,
     ) -> Result<ProtoGenerateRequest, String> {
         match self {
             Self::Sglang(client) => {
-                let sglang_mm = multimodal_inputs.map(|mm| match mm {
+                let sglang_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Sglang(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -459,13 +466,16 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    sglang_mm,
-                    tool_constraints,
+                    SglangGenerateRequestOptions {
+                        multimodal_inputs: sglang_mm,
+                        tool_call_constraint: options.tool_constraints,
+                        require_reasoning: options.require_reasoning,
+                    },
                 )?;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(client) => {
-                let vllm_mm = multimodal_inputs.map(|mm| match mm {
+                let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Vllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -475,12 +485,12 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     vllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
             }
             Self::Trtllm(client) => {
-                let trtllm_mm = multimodal_inputs.map(|mm| match mm {
+                let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Trtllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -490,7 +500,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -501,12 +511,12 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
             Self::TokenSpeed(client) => {
-                let tokenspeed_mm = multimodal_inputs.map(|mm| match mm {
+                let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::TokenSpeed(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -516,7 +526,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     tokenspeed_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
             }
@@ -533,12 +543,11 @@ impl GrpcClient {
         body: &CreateMessageRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        multimodal_inputs: Option<MultimodalData>,
-        tool_constraints: Option<(String, String)>,
+        options: GenerateRequestBuildOptions,
     ) -> Result<ProtoGenerateRequest, String> {
         match self {
             Self::Sglang(client) => {
-                let sglang_mm = multimodal_inputs.map(|mm| match mm {
+                let sglang_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Sglang(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -547,13 +556,16 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    sglang_mm,
-                    tool_constraints,
+                    SglangGenerateRequestOptions {
+                        multimodal_inputs: sglang_mm,
+                        tool_call_constraint: options.tool_constraints,
+                        require_reasoning: options.require_reasoning,
+                    },
                 )?;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(client) => {
-                let vllm_mm = multimodal_inputs.map(|mm| match mm {
+                let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Vllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -563,12 +575,12 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     vllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
             }
             Self::Trtllm(client) => {
-                let trtllm_mm = multimodal_inputs.map(|mm| match mm {
+                let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Trtllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -578,7 +590,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -589,12 +601,12 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
             Self::TokenSpeed(client) => {
-                let tokenspeed_mm = multimodal_inputs.map(|mm| match mm {
+                let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::TokenSpeed(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -604,7 +616,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     tokenspeed_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
             }

@@ -389,6 +389,20 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
+    // Multimodal tensor transport (shm vs inline), labeled by runtime.
+    describe_counter!(
+        "smg_mm_tensors_total",
+        "Multimodal tensors sent, by runtime and transport path (shm/inline)"
+    );
+    describe_counter!(
+        "smg_mm_tensor_bytes_total",
+        "Multimodal tensor bytes sent, by runtime and transport path (shm/inline)"
+    );
+    describe_counter!(
+        "smg_mm_shm_write_failures_total",
+        "SHM tensor write attempts that failed and fell back to inline, by runtime"
+    );
+
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
 
@@ -630,6 +644,18 @@ impl Metrics {
             "result" => result
         )
         .increment(1);
+    }
+
+    /// Record one multimodal tensor sent over `path` ("shm"|"inline") for `runtime`.
+    pub fn record_mm_tensor(runtime: &'static str, path: &'static str, nbytes: usize) {
+        counter!("smg_mm_tensors_total", "runtime" => runtime, "path" => path).increment(1);
+        counter!("smg_mm_tensor_bytes_total", "runtime" => runtime, "path" => path)
+            .increment(nbytes as u64);
+    }
+
+    /// Record a SHM tensor write that failed and fell back to inline, for `runtime`.
+    pub fn record_mm_shm_write_failure(runtime: &'static str) {
+        counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
     }
 
     // ========================================================================

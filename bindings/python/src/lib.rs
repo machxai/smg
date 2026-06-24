@@ -802,8 +802,6 @@ impl Router {
         max_idle_secs = 14400,
         assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
-        multimodal_tensor_transport = None,
-        multimodal_shm_min_bytes = None,
         dp_aware = false,
         dp_minimum_tokens_scheduler = false,
         api_key = None,
@@ -896,6 +894,8 @@ impl Router {
         // positional argument keeps its index for callers that construct
         // `_Router(...)` positionally. See the struct-field note above.
         health_check_port = None,
+        multimodal_tensor_transport = None,
+        multimodal_shm_min_bytes = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -924,8 +924,6 @@ impl Router {
         max_idle_secs: u64,
         assignment_mode: String,
         max_payload_size: usize,
-        multimodal_tensor_transport: Option<String>,
-        multimodal_shm_min_bytes: Option<usize>,
         dp_aware: bool,
         dp_minimum_tokens_scheduler: bool,
         api_key: Option<String>,
@@ -1017,6 +1015,8 @@ impl Router {
         // Appended last to match the `#[pyo3(signature)]` order above and
         // preserve positional-argument compatibility.
         health_check_port: Option<u16>,
+        multimodal_tensor_transport: Option<String>,
+        multimodal_shm_min_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 

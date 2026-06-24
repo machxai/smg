@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import shutil
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,10 @@ class TestMultimodalVllmShmTransport:
         )
         logger.info("SHM image response: %s (shm tensors %s -> %s)", text, before, after)
 
+    @pytest.mark.skipif(
+        shutil.which("ffmpeg") is None,
+        reason="ffmpeg not installed; required to decode video_url inputs",
+    )
     def test_single_video_uses_shm_transport(self, model, setup_backend):
         """Video is the large-tensor case: pixel_values_videos is many frames of
         patches, so it decisively exercises the SHM transport for vLLM video."""

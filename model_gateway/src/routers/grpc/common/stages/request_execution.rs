@@ -568,9 +568,13 @@ impl RequestExecutionStage {
 
         debug!("vLLM PD: prefill completed, sending decode request");
 
-        // Decode reuses proto_request as-is; same request_id as the prefill leg is
-        // load-bearing for NIXL P/D correlation on vLLM < 0.13
+        // Decode keeps the prefill request_id (load-bearing for NIXL P/D
+        // correlation on vLLM < 0.13). Strip multimodal data: the decode worker
+        // only needs the transferred KV cache, not the pixel tensors, and reusing
+        // an SHM handle would re-read a segment the prefill servicer already
+        // unlinked. Mirrors execute_dual_dispatch.
         let mut decode_request = proto_request;
+        decode_request.clear_mm_inputs();
         if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
             decode_request.set_data_parallel_rank(rank as i32);
         }

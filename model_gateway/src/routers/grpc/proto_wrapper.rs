@@ -377,7 +377,7 @@ fn mm_tensor_payload(
     engine: &'static str,
 ) -> MmTensorPayload {
     use crate::observability::metrics::Metrics;
-    let log_timing = log_tokenspeed_mm_timing_enabled();
+    let log_timing = log_mm_timing_enabled();
     let nbytes = data.len();
     if !shm_enabled || nbytes < shm_min_bytes {
         if log_timing {
@@ -453,7 +453,7 @@ fn tensor_bytes_to_vllm(
     }
 }
 
-fn log_tokenspeed_mm_timing_enabled() -> bool {
+fn log_mm_timing_enabled() -> bool {
     std::env::var("SMG_LOG_MM_TIMING")
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
@@ -503,7 +503,14 @@ fn write_mm_shm(data: &[u8]) -> std::io::Result<common::ShmHandle> {
 pub fn mm_shm_dev_writable() -> bool {
     static WRITABLE: OnceLock<bool> = OnceLock::new();
     *WRITABLE.get_or_init(|| {
-        let name = format!("smg-mm-probe-{}", process::id());
+        // pid alone collides across separate PID namespaces that share /dev/shm
+        // (each can be PID 1); add a nanosecond stamp so the `create_new` probe
+        // doesn't spuriously fail and cache `false` for a writable /dev/shm.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let name = format!("{}probe-{}-{}", MM_SHM_NAME_PREFIX, process::id(), nanos);
         let path = mm_shm_path(&name);
         // `create_new` (no clobber) + owner-only mode: /dev/shm is world-writable,
         // so plain create(truncate) is open to symlink/clobber attacks and the

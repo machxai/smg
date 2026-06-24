@@ -10,6 +10,13 @@ from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_
 logger = logging.getLogger(__name__)
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {parsed}")
+    return parsed
+
+
 COMMON_POLICY_CHOICES = [
     "random",
     "round_robin",
@@ -500,7 +507,7 @@ class RouterArgs:
         )
         multimodal_group.add_argument(
             f"--{prefix}multimodal-shm-min-bytes",
-            type=int,
+            type=_non_negative_int,
             default=None,
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
         )

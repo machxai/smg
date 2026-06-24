@@ -1753,7 +1753,17 @@ fn resolve_mm_shm_enabled(
     let global_mode = transport
         .map(|transport| transport.mode.as_str())
         .unwrap_or(DEFAULT_MM_TENSOR_TRANSPORT);
-    let mode = worker_transport_mode_override(workers).unwrap_or_else(|| global_mode.to_string());
+    // A per-worker override wins, but only when it's a recognized mode; an
+    // invalid override is logged and ignored so a typo can't silently disable a
+    // valid global shm/auto.
+    let mode = match worker_transport_mode_override(workers) {
+        Some(mode) if matches!(mode.as_str(), "inline" | "shm" | "auto") => mode,
+        Some(invalid) => {
+            log_unknown_mm_transport_once(&invalid);
+            global_mode.to_string()
+        }
+        None => global_mode.to_string(),
+    };
     match mode.as_str() {
         // SHM only ever happens when SMG can actually write /dev/shm.
         "shm" => mm_shm_dev_writable(),

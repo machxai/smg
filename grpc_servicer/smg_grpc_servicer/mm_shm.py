@@ -48,7 +48,10 @@ def tensor_payload_bytes_from_shm(shm_handle, shm_dir: str = DEFAULT_SHM_DIR) ->
     path = os.path.join(shm_dir, name)
     fd = None
     try:
-        fd = os.open(path, os.O_RDONLY)
+        # O_NOFOLLOW: /dev/shm is world-writable, so a same-host attacker could
+        # plant a symlink at the (validated) name pointing at an arbitrary file;
+        # refuse to follow it so a crafted handle can't read/unlink outside SHM.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         raw = os.pread(fd, int(shm_handle.nbytes), int(shm_handle.offset))
     finally:
         if fd is not None:

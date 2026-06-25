@@ -503,14 +503,8 @@ fn write_mm_shm(data: &[u8]) -> std::io::Result<common::ShmHandle> {
 pub fn mm_shm_dev_writable() -> bool {
     static WRITABLE: OnceLock<bool> = OnceLock::new();
     *WRITABLE.get_or_init(|| {
-        // pid alone collides across separate PID namespaces that share /dev/shm
-        // (each can be PID 1); add a nanosecond stamp so the `create_new` probe
-        // doesn't spuriously fail and cache `false` for a writable /dev/shm.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let name = format!("{}probe-{}-{}", MM_SHM_NAME_PREFIX, process::id(), nanos);
+        // Unique name; pid alone collides across PID namespaces sharing /dev/shm.
+        let name = next_mm_shm_name();
         let path = mm_shm_path(&name);
         // `create_new` (no clobber) + owner-only mode: /dev/shm is world-writable,
         // so plain create(truncate) is open to symlink/clobber attacks and the

@@ -1750,20 +1750,15 @@ fn resolve_mm_shm_enabled(
     transport: Option<&MmTransportConfig>,
 ) -> bool {
     log_mm_transport_config_once(transport);
-    // SHM is single-consumer (the servicer unlinks each segment after reading),
-    // but a PD request has two legs: prefill always reads, and decode re-reads
-    // whenever it recomputes the prompt instead of resuming from transferred KV.
-    // Force inline for disaggregated requests to avoid both the double-read and
-    // dropping pixels the decode leg still needs.
+    // SHM segments are single-consumer (unlinked after one read); a PD decode leg
+    // may re-read or recompute, so force inline for disaggregated requests.
     if matches!(workers, Some(WorkerSelection::Dual { .. })) {
         return false;
     }
     let global_mode = transport
         .map(|transport| transport.mode.as_str())
         .unwrap_or(DEFAULT_MM_TENSOR_TRANSPORT);
-    // A per-worker override wins, but only when it's a recognized mode; an
-    // invalid override is logged and ignored so a typo can't silently disable a
-    // valid global shm/auto.
+    // Ignore an unrecognized per-worker override so a typo can't disable a valid global.
     let mode = match worker_transport_mode_override(workers) {
         Some(mode) if matches!(mode.as_str(), "inline" | "shm" | "auto") => mode,
         Some(invalid) => {

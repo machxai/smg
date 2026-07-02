@@ -1261,9 +1261,15 @@ impl Router {
                     // advertise address so the mesh identity — and the
                     // deterministic worker-id namespace keyed on it — survives
                     // restarts. ':' is the rl shard-key separator, hence '-'.
-                    let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
-                        format!("Mesh_{}", advertise_addr.to_string().replace(':', "-"))
-                    });
+                    let self_name = match self.mesh_server_name.clone() {
+                        Some(name) => {
+                            config::validate_mesh_server_name(&name).map_err(|e| {
+                                pyo3::exceptions::PyValueError::new_err(e.to_string())
+                            })?;
+                            name
+                        }
+                        None => format!("Mesh_{}", advertise_addr.to_string().replace(':', "-")),
+                    };
                     Some(smg_mesh::MeshServerConfig {
                         self_name,
                         bind_addr,

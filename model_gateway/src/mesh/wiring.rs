@@ -43,6 +43,13 @@ impl MeshAdapters {
         node_name: String,
         worker_registry: Arc<WorkerRegistry>,
     ) -> Arc<Self> {
+        // Checked before the namespace install: the registry's id namespace
+        // is first-writer-wins, so a later panic must not leave a shared
+        // registry stuck with an invalid value.
+        assert!(
+            !node_name.is_empty() && !node_name.contains(':'),
+            "mesh node name must be non-empty and must not contain ':'"
+        );
         // Deterministic worker ids: a restarted node republishes its
         // workers under their previous mesh keys, so tombstones resolve
         // and no orphan keys form. Installed here because this runs

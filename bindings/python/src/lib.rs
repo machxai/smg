@@ -484,6 +484,8 @@ struct Router {
     epd_disaggregation: bool,
     encode_urls: Option<Vec<(String, Option<u16>)>>,
     encode_policy: Option<PolicyType>,
+    multimodal_tensor_transport: Option<String>,
+    multimodal_shm_min_bytes: Option<usize>,
 }
 
 impl Router {
@@ -526,6 +528,23 @@ impl Router {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
+
+        // Validate the transport mode up front. The CLI (value_parser) and the
+        // argparse path (choices) already reject bad values; this covers direct
+        // programmatic `RouterArgs` use, matching the CLI/Rust parsing contract.
+        let multimodal_tensor_transport = self
+            .multimodal_tensor_transport
+            .as_deref()
+            .map(|value| {
+                config::TransportMode::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "multimodal_tensor_transport".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'inline', 'shm', or 'auto'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -785,6 +804,8 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .multimodal_tensor_transport(multimodal_tensor_transport)
+            .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -930,6 +951,8 @@ impl Router {
         epd_disaggregation = false,
         encode_urls = None,
         encode_policy = None,
+        multimodal_tensor_transport = None,
+        multimodal_shm_min_bytes = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1054,6 +1077,8 @@ impl Router {
         epd_disaggregation: bool,
         encode_urls: Option<Vec<(String, Option<u16>)>>,
         encode_policy: Option<PolicyType>,
+        multimodal_tensor_transport: Option<String>,
+        multimodal_shm_min_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1192,6 +1217,8 @@ impl Router {
             epd_disaggregation,
             encode_urls,
             encode_policy,
+            multimodal_tensor_transport,
+            multimodal_shm_min_bytes,
         })
     }
 

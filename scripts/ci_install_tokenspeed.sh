@@ -68,9 +68,15 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${LD_
 # Torch's JIT cpp_extension builder compiles some TokenSpeed runtime
 # extensions (e.g. ``tokenspeed_hostfunc_ext``) with plain g++ and
 # doesn't pass ``-I$CUDA_HOME/include``; expose the headers via CPATH /
-# CPLUS_INCLUDE_PATH so the compile picks them up.
-export CPATH="${CUDA_HOME}/include${CPATH:+:$CPATH}"
-export CPLUS_INCLUDE_PATH="${CUDA_HOME}/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+# CPLUS_INCLUDE_PATH so the compile picks them up. CUDA 13 relocated the CCCL
+# headers (Thrust/CUB/libcu++) into ``include/cccl``, and the kernel's trtllm
+# sources need them; put that dir first (matches TokenSpeed's own
+# test/ci_system/install_deps.sh). Without it the CUDA 13 kernel build fails
+# with ``error: '__cudaLaunch' was not declared`` for sm_90a.
+_cuda_inc="${CUDA_HOME}/include/cccl:${CUDA_HOME}/include"
+export CPATH="${_cuda_inc}${CPATH:+:$CPATH}"
+export CPLUS_INCLUDE_PATH="${_cuda_inc}${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+export C_INCLUDE_PATH="${_cuda_inc}${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
 
 # ── Clone TokenSpeed ────────────────────────────────────────────────────────
 # ``git clone --branch`` only accepts branch/tag names, not SHAs, so we
@@ -97,6 +103,9 @@ sudo apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev cmake
 # ── TokenSpeed packages ────────────────────────────────────────────────────
 export MAX_JOBS="${MAX_JOBS:-16}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-9.0a 10.0a}"
+# Select the CUDA kernel backend explicitly, as TokenSpeed's own install_deps.sh
+# does on the kernel build (otherwise the native build path can differ).
+export TOKENSPEED_KERNEL_BACKEND="${TOKENSPEED_KERNEL_BACKEND:-cuda}"
 
 # The kernel requirements leave ``nvidia-cutlass-dsl`` unpinned, and 4.6.0
 # dropped ``cute.core.ThrMma`` — which quack (pulled via flash-attn's cute
@@ -128,6 +137,7 @@ if [ -n "${GITHUB_ENV:-}" ]; then
     # CUDA headers when it bypasses nvcc for .cpp sources.
     echo "CPATH=$CPATH" >> "$GITHUB_ENV"
     echo "CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH" >> "$GITHUB_ENV"
+    echo "C_INCLUDE_PATH=$C_INCLUDE_PATH" >> "$GITHUB_ENV"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then
     # Make ``nvcc`` discoverable to downstream steps (pytest spawns the

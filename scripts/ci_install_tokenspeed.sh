@@ -107,6 +107,17 @@ export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-9.0a 10.0a}"
 # does on the kernel build (otherwise the native build path can differ).
 export TOKENSPEED_KERNEL_BACKEND="${TOKENSPEED_KERNEL_BACKEND:-cuda}"
 
+# The kernel's torch cpp_extension build must link a torch built for CUDA 13.
+# TokenSpeed's CI runs on a cu130 Docker base image that already ships it; the
+# generic k8s runner does not, so pip/uv would pull the default PyPI torch
+# (CUDA 12.x). That drops nvidia-cuda-runtime-cu12's own crt/host_runtime.h on
+# the include path, and nvcc 13's cudafe++ then generates a host stub that fails
+# to compile against those cu12 headers: "'__cudaLaunch' was not declared".
+# Point pip/uv at the cu130 wheel index (mirrors install_deps.sh line 118) so
+# every install below resolves the CUDA-13 torch + nvidia deps.
+export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+export UV_EXTRA_INDEX_URL="${UV_EXTRA_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+
 # The kernel requirements leave ``nvidia-cutlass-dsl`` unpinned, and 4.6.0
 # dropped ``cute.core.ThrMma`` — which quack (pulled via flash-attn's cute
 # backend) uses, breaking ``import tokenspeed``. Pin to the last compatible
@@ -124,6 +135,12 @@ export PIP_CONSTRAINT="$TOKENSPEED_CONSTRAINTS"
 # ``setuptools.build_meta`` without declaring ``setuptools`` in
 # ``build-system.requires``, and we install with ``--no-build-isolation``.
 uv pip install setuptools wheel pybind11
+
+# Install the CUDA-13 torch build explicitly (the +cu130 local wheel) before the
+# --no-build-isolation kernel compile below, so the build links matching CUDA 13
+# headers instead of the default PyPI (cu12.x) torch. Pin tracks TokenSpeed's
+# torch requirement; bump alongside TOKENSPEED_REF.
+uv pip install "torch==2.11.0+cu130"
 
 uv pip install -e tokenspeed-kernel/python/ --no-build-isolation
 uv pip install -e tokenspeed-scheduler/

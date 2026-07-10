@@ -432,6 +432,21 @@ class Worker:
                 env["NCCL_SHM_DISABLE"] = "1"
                 env["TLLM_DISABLE_ALLREDUCE_AUTOTUNE"] = "1"
 
+        # EPD's mooncake transfer engine registers GPU memory for RDMA. mooncake
+        # defaults to the legacy nvidia_peermem GPUDirect path (WITH_NVIDIA_PEERMEM,
+        # a runtime env var that defaults to true), which fails to register GPU
+        # buffers with EFAULT on the NVIDIA Open Kernel driver the GPU runners use
+        # (no nvidia_peermem module). Force the dmabuf path instead — the open
+        # driver supports it and it registers GPU memory fine — so encode/prefill/
+        # decode workers come up instead of hanging on the swallowed registration
+        # failure. Verified on a GB300 box: peermem -> EFAULT, dmabuf -> rc=0.
+        if self.engine == "tokenspeed" and self.worker_type in (
+            WorkerType.ENCODE,
+            WorkerType.PREFILL,
+            WorkerType.DECODE,
+        ):
+            env.setdefault("WITH_NVIDIA_PEERMEM", "false")
+
         return env
 
     def _spawn_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:

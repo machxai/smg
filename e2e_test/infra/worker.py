@@ -478,6 +478,10 @@ class Worker:
             env.setdefault("NO_PROXY", "*")
             env.setdefault("no_proxy", "*")
             env.setdefault("TOKENSPEED_GRPC_MAX_MESSAGE_BYTES", "2000000000")
+            # The 35B FP8 LM is tight on one 80GB card; reduce allocator
+            # fragmentation so generation doesn't OOM on reserved-but-unallocated
+            # memory (the OOM error explicitly recommends this).
+            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
         return env
 

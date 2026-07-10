@@ -175,6 +175,21 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "multimodal", "moe"],
         "startup_timeout": 600,
+        # Keep the 35B FP8 LM (prefill/decode) inside one 80GB H100 with headroom
+        # for generation activations + the mooncake/EPD buffers. TokenSpeed's
+        # defaults (gpu-mem-util auto ~0.9, kvstore-ratio 2.0, 131K-token KV pool)
+        # fill the card and OOM mid-generate -> empty response. A short context is
+        # ample for the single-image smoke test; the encode role ignores LM knobs.
+        "tokenspeed_args": [
+            "--gpu-memory-utilization",
+            "0.75",
+            "--max-model-len",
+            "8192",
+            "--max-num-seqs",
+            "8",
+            "--kvstore-ratio",
+            "0.5",
+        ],
         # ~35GB and TokenSpeed-only (EPD). Exclude from tier-wide pre-download so
         # the sglang/vLLM/TRT lanes (which never run EPD) don't pull it; the
         # tokenspeed EPD job downloads it explicitly by id.

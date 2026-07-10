@@ -240,4 +240,42 @@ assert not shadowed, f'smg gRPC modules shadowed by site-packages copies: {shado
 print('smg gRPC modules resolve to repo source: OK')
 "
 
+# ── RDMA / mooncake GPU-registration probe (TEMPORARY — remove before merge) ──
+# Answers definitively whether the H100 CI box supports the mooncake RDMA
+# GPU-memory registration EPD needs: the EPD workers hang right after mooncake's
+# transfer engine starts listening, and the next step is register_memory on a
+# GPU buffer (needs GPUDirect: nvidia_peermem or dmabuf). Runs under a hard
+# timeout so it can never hang the lane; never fails the lane either.
+echo "=== RDMA probe: kernel modules / GPUDirect ==="
+lsmod 2>/dev/null | grep -iE "peermem|mlx5_ib|ib_uverbs|nvidia_fs" || echo "  (no matching modules)"
+if [ -d /sys/module/nvidia_peermem ]; then echo "  nvidia_peermem: LOADED"; else echo "  nvidia_peermem: NOT loaded"; fi
+command -v rdma >/dev/null 2>&1 && rdma link 2>/dev/null | head -3 || true
+echo "=== RDMA probe: mooncake init + GPU register_memory (60s timeout) ==="
+set +e
+timeout 60 python3 - <<'PY'
+import socket, sys
+try:
+    import torch
+    from mooncake.engine import TransferEngine
+except Exception as e:
+    print("PROBE import failed:", e); sys.exit(3)
+if not torch.cuda.is_available():
+    print("PROBE: no CUDA device visible"); sys.exit(4)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]; s.close()
+eng = TransferEngine()
+rc = eng.initialize(ip, "P2PHANDSHAKE", "rdma", "mlx5_0")
+print("PROBE initialize rc =", rc, "(0=ok)", flush=True)
+if rc != 0:
+    sys.exit(5)
+buf = torch.zeros(1 << 20, device="cuda")
+print("PROBE registering 1MiB GPU buffer with RDMA ...", flush=True)
+rc = eng.register_memory(buf.data_ptr(), buf.numel() * buf.element_size())
+print("PROBE register_memory rc =", rc, "-> GPU RDMA registration WORKS" if rc == 0 else "-> register FAILED")
+PY
+rc=$?
+[ "$rc" = 124 ] && echo "PROBE: mooncake init+register HUNG (60s timeout) -> GPU RDMA registration is the EPD blocker"
+[ "$rc" != 0 ] && [ "$rc" != 124 ] && echo "PROBE: exited rc=$rc (see above)"
+set -e
+
 echo "TokenSpeed installation complete"

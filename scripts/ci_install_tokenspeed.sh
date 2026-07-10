@@ -42,30 +42,39 @@ echo "uv version: $(uv --version)"
 # SDK (nvcc, headers). Install them on demand — same approach as
 # ``ci_install_sglang.sh``.
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-if [ ! -x "${CUDA_HOME}/bin/nvcc" ]; then
-    echo "Installing CUDA toolkit (nvcc not found at ${CUDA_HOME}/bin/nvcc)..."
+if [ ! -x "${CUDA_HOME}/bin/nvcc" ] && [ ! -x "/usr/local/cuda-13.0/bin/nvcc" ]; then
+    echo "Installing CUDA toolkit (nvcc not found)..."
     curl -fsSL -o /tmp/cuda-keyring.deb \
         https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
     sudo dpkg -i /tmp/cuda-keyring.deb
     rm /tmp/cuda-keyring.deb
     sudo apt-get update -qq
     # Install the FULL CUDA 13.0 toolkit (mirrors the proven TRT-LLM lane in
-    # ci_install_trtllm.sh) so the system headers -- which the kernel build is
-    # aligned to below -- are a complete, self-consistent 13.0.88 set matching
+    # ci_install_trtllm.sh) so the system headers -- which the kernel build
+    # compiles against -- are a complete, self-consistent 13.0.88 set matching
     # the system nvcc.
     sudo apt-get install -y cuda-toolkit-13-0
-    # apt installs under /usr/local/cuda-13.0; expose the /usr/local/cuda
-    # alias the job-level ``CUDA_HOME: /usr/local/cuda`` env expects.
-    if [ ! -d "${CUDA_HOME}/bin" ] && [ -d "/usr/local/cuda-13.0/bin" ]; then
-        sudo ln -sfn /usr/local/cuda-13.0 "${CUDA_HOME}"
-    fi
-    echo "nvcc installed: $(${CUDA_HOME}/bin/nvcc --version | tail -1)"
-else
-    echo "nvcc already available: $(${CUDA_HOME}/bin/nvcc --version | tail -1)"
+fi
+# Point CUDA_HOME at the versioned toolkit dir directly (mirrors
+# ci_install_trtllm.sh). The job env sets CUDA_HOME=/usr/local/cuda, but on this
+# runner that symlink is stale/partial: its include/ has cuda_runtime.h but not
+# crt/host_runtime.h, so the kernel's host-stub compile falls through to torch's
+# mismatched bundled crt and dies with "'__cudaLaunch' was not declared". The
+# apt-installed /usr/local/cuda-13.0 is complete (ships cuda-crt-13-0).
+if [ -x "/usr/local/cuda-13.0/bin/nvcc" ]; then
+    CUDA_HOME="/usr/local/cuda-13.0"
 fi
 export CUDA_HOME
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${LD_LIBRARY_PATH:-}"
+echo "Using CUDA_HOME=${CUDA_HOME} ($(${CUDA_HOME}/bin/nvcc --version | tail -1))"
+# The kernel's launch stubs need this exact header from the system toolkit; if
+# it's missing the build falls through to torch's bundled cu13 crt and fails.
+if [ -f "${CUDA_HOME}/include/crt/host_runtime.h" ]; then
+    echo "system crt/host_runtime.h: present under CUDA_HOME"
+else
+    echo "WARNING: ${CUDA_HOME}/include/crt/host_runtime.h is MISSING" >&2
+fi
 # Torch's JIT cpp_extension builder compiles some TokenSpeed runtime extensions
 # (e.g. ``tokenspeed_hostfunc_ext``) with plain g++ and doesn't pass
 # ``-I$CUDA_HOME/include``; expose the system CUDA headers via CPATH so those
@@ -138,26 +147,6 @@ uv pip install setuptools wheel pybind11
 # headers instead of the default PyPI (cu12.x) torch. Pin tracks TokenSpeed's
 # torch requirement; bump alongside TOKENSPEED_REF.
 uv pip install "torch==2.11.0+cu130"
-
-# Align torch's bundled CUDA crt headers with the system toolkit. The +cu130
-# wheels ship crt/host_runtime.h under site-packages/nvidia/cu*/include/crt at a
-# different CUDA patch level than the apt system nvcc (cuda-13.0.88), and the
-# kernel/flashinfer build feeds that dir to the host-stub compile ahead of the
-# system include (via nvcc's host-compiler flags, which -I ordering can't
-# override). The 13.0.88 nvcc emits a 2-arg __cudaLaunch stub the bundled 1-arg
-# macro can't satisfy -> "'__cudaLaunch' was not declared". Point each bundled
-# crt dir at the system crt so the launch stubs always match the nvcc that
-# generated them, regardless of include order.
-_sys_crt="${CUDA_HOME}/include/crt"
-if [ -d "$_sys_crt" ]; then
-    _site_pkgs="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
-    for _pip_crt in "${_site_pkgs}"/nvidia/cu*/include/crt; do
-        [ -d "$_pip_crt" ] || continue
-        echo "Aligning bundled CUDA crt headers to system: ${_pip_crt} -> ${_sys_crt}"
-        rm -rf "$_pip_crt"
-        ln -sfnT "$_sys_crt" "$_pip_crt"
-    done
-fi
 
 uv pip install -e tokenspeed-kernel/python/ --no-build-isolation
 uv pip install -e tokenspeed-scheduler/

@@ -76,6 +76,9 @@ cmd_install() {
     # Resolve torch + nvidia cu13 wheels from the pytorch cu130 index.
     export UV_EXTRA_INDEX_URL="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
     export PIP_EXTRA_INDEX_URL="$UV_EXTRA_INDEX_URL"
+    # The kernel's setup.py shells out to plain pip; without a socket timeout a
+    # stalled download hangs forever. Fail fast (30s no-data) and retry instead.
+    export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-30}" PIP_RETRIES="${PIP_RETRIES:-10}"
     # cutlass pin: 4.6.0 dropped cute.core.ThrMma that quack needs (see CI script).
     local con; con="$(mktemp)"; echo "nvidia-cutlass-dsl==4.5.2" > "$con"
     export UV_CONSTRAINT="$con" PIP_CONSTRAINT="$con"

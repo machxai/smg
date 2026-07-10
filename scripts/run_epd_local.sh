@@ -63,16 +63,24 @@ epd_env() {
 cmd_install() {
     local arch; arch="$(detect_arch)"
     echo ">>> building EPD stack: venv=${VENV} CUDA_HOME=${CUDA_HOME} arch=${arch}"
-    # Layer on top of the torch env so we don't pollute it.
-    uv venv --python "$TORCH_PY" --system-site-packages "$VENV"
+    # Clean venv, NOT --system-site-packages: inheriting a torch-2.12 conda env
+    # breaks its prebuilt C-extensions (torchcomms, ...) as soon as the kernel
+    # pins torch 2.11. A fresh env with torch 2.11+cu130 avoids the clash and
+    # still runs on sm_103 (verified on GB300).
+    uv venv --python "${VENV_PYTHON:-3.12}" "$VENV"
 
     export CUDA_HOME PATH="${CUDA_HOME}/bin:${PATH}"
     export MAX_JOBS="${MAX_JOBS:-32}" FLASHINFER_CUDA_ARCH_LIST="$arch" TOKENSPEED_KERNEL_BACKEND=cuda
+    # Resolve torch + nvidia cu13 wheels from the pytorch cu130 index.
+    export UV_EXTRA_INDEX_URL="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
+    export PIP_EXTRA_INDEX_URL="$UV_EXTRA_INDEX_URL"
     # cutlass pin: 4.6.0 dropped cute.core.ThrMma that quack needs (see CI script).
     local con; con="$(mktemp)"; echo "nvidia-cutlass-dsl==4.5.2" > "$con"
     export UV_CONSTRAINT="$con" PIP_CONSTRAINT="$con"
 
     uv pip install --python "${VENV}/bin/python" setuptools wheel pybind11
+    # The CUDA-13 torch the kernel expects, up front in the clean env.
+    uv pip install --python "${VENV}/bin/python" "torch==${TORCH_VERSION:-2.11.0}+cu130"
     # TokenSpeed: kernel (from source) -> scheduler -> engine. Same order as CI.
     uv pip install --python "${VENV}/bin/python" -e "${TS_SRC}/tokenspeed-kernel/python/" --no-build-isolation
     uv pip install --python "${VENV}/bin/python" -e "${TS_SRC}/tokenspeed-scheduler/"

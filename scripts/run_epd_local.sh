@@ -67,7 +67,9 @@ cmd_install() {
     # breaks its prebuilt C-extensions (torchcomms, ...) as soon as the kernel
     # pins torch 2.11. A fresh env with torch 2.11+cu130 avoids the clash and
     # still runs on sm_103 (verified on GB300).
-    uv venv --python "${VENV_PYTHON:-3.12}" "$VENV"
+    # --seed installs pip/setuptools/wheel: tokenspeed-kernel's setup.py shells
+    # out to `python -m pip install -r requirements/cuda.txt`, so the venv needs pip.
+    uv venv --python "${VENV_PYTHON:-3.12}" --seed "$VENV"
 
     export CUDA_HOME PATH="${CUDA_HOME}/bin:${PATH}"
     export MAX_JOBS="${MAX_JOBS:-32}" FLASHINFER_CUDA_ARCH_LIST="$arch" TOKENSPEED_KERNEL_BACKEND=cuda

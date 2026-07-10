@@ -49,12 +49,10 @@ if [ ! -x "${CUDA_HOME}/bin/nvcc" ]; then
     sudo dpkg -i /tmp/cuda-keyring.deb
     rm /tmp/cuda-keyring.deb
     sudo apt-get update -qq
-    # Install the FULL CUDA 13.0 toolkit (not a piecemeal nvcc + cudart +
-    # libraries set) so the system headers are a complete, self-consistent match
-    # for the system nvcc -- mirrors the proven TRT-LLM lane (ci_install_trtllm.sh
-    # installs cuda-toolkit-13-0). A partial system toolkit makes the kernel build
-    # fall back to torch's bundled cu13 headers, whose crt/host_runtime.h is a
-    # different patch level and breaks the nvcc-generated launch stubs.
+    # Install the FULL CUDA 13.0 toolkit (mirrors the proven TRT-LLM lane in
+    # ci_install_trtllm.sh) so the system headers -- which the kernel build is
+    # aligned to below -- are a complete, self-consistent 13.0.88 set matching
+    # the system nvcc.
     sudo apt-get install -y cuda-toolkit-13-0
     # apt installs under /usr/local/cuda-13.0; expose the /usr/local/cuda
     # alias the job-level ``CUDA_HOME: /usr/local/cuda`` env expects.
@@ -76,17 +74,6 @@ _cuda_inc="${CUDA_HOME}/include:${CUDA_HOME}/include/cccl"
 export CPATH="${_cuda_inc}${CPATH:+:$CPATH}"
 export CPLUS_INCLUDE_PATH="${_cuda_inc}${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
 export C_INCLUDE_PATH="${_cuda_inc}${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
-
-# nvcc drives the host-compilation of its OWN generated launch stubs, which must
-# see the crt/host_runtime.h matching the nvcc that generated them. torch's
-# +cu130 wheels drop their own copy under site-packages/nvidia/cu13/include, and
-# torch's CUDAExtension puts that dir on the nvcc command line -- shadowing
-# nvcc's built-in system headers. When the pip cu13 patch level differs from the
-# system nvcc, the stub calls the 2-arg __cudaLaunch the system nvcc emits while
-# the pip header only #defines the 1-arg macro form -> "'__cudaLaunch' was not
-# declared". Prepend the system include so it wins over torch's bundled headers
-# on every nvcc invocation (the host stub compile included).
-export NVCC_PREPEND_FLAGS="-I${CUDA_HOME}/include ${NVCC_PREPEND_FLAGS:-}"
 
 # ── Clone TokenSpeed ────────────────────────────────────────────────────────
 # ``git clone --branch`` only accepts branch/tag names, not SHAs, so we
@@ -152,6 +139,26 @@ uv pip install setuptools wheel pybind11
 # torch requirement; bump alongside TOKENSPEED_REF.
 uv pip install "torch==2.11.0+cu130"
 
+# Align torch's bundled CUDA crt headers with the system toolkit. The +cu130
+# wheels ship crt/host_runtime.h under site-packages/nvidia/cu*/include/crt at a
+# different CUDA patch level than the apt system nvcc (cuda-13.0.88), and the
+# kernel/flashinfer build feeds that dir to the host-stub compile ahead of the
+# system include (via nvcc's host-compiler flags, which -I ordering can't
+# override). The 13.0.88 nvcc emits a 2-arg __cudaLaunch stub the bundled 1-arg
+# macro can't satisfy -> "'__cudaLaunch' was not declared". Point each bundled
+# crt dir at the system crt so the launch stubs always match the nvcc that
+# generated them, regardless of include order.
+_sys_crt="${CUDA_HOME}/include/crt"
+if [ -d "$_sys_crt" ]; then
+    _site_pkgs="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+    for _pip_crt in "${_site_pkgs}"/nvidia/cu*/include/crt; do
+        [ -d "$_pip_crt" ] || continue
+        echo "Aligning bundled CUDA crt headers to system: ${_pip_crt} -> ${_sys_crt}"
+        rm -rf "$_pip_crt"
+        ln -sfnT "$_sys_crt" "$_pip_crt"
+    done
+fi
+
 uv pip install -e tokenspeed-kernel/python/ --no-build-isolation
 uv pip install -e tokenspeed-scheduler/
 uv pip install -e "./python" --no-build-isolation
@@ -165,9 +172,6 @@ if [ -n "${GITHUB_ENV:-}" ]; then
     echo "CPATH=$CPATH" >> "$GITHUB_ENV"
     echo "CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH" >> "$GITHUB_ENV"
     echo "C_INCLUDE_PATH=$C_INCLUDE_PATH" >> "$GITHUB_ENV"
-    # Persist so worker-side JIT kernel builds (spawned by pytest) also force the
-    # system headers ahead of torch's bundled cu13 copy.
-    echo "NVCC_PREPEND_FLAGS=$NVCC_PREPEND_FLAGS" >> "$GITHUB_ENV"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then
     # Make ``nvcc`` discoverable to downstream steps (pytest spawns the

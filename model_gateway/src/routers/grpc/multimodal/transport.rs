@@ -155,17 +155,17 @@ pub(super) fn resolve_mm_shm_min_bytes(workers: Option<&WorkerSelection>) -> usi
 }
 
 /// Resolve whether vLLM `pixel_values` may use the RDMA lane for this request: the
-/// resolved transport mode is `rdma`, the gateway exporter is up, and the worker
-/// advertises it can pull. The capability gate keeps SMG from emitting a `remote`
-/// payload to a worker that would reject it. The exporter is a process-wide
-/// resource (NIXL agent + arena), so a per-worker mode override can gate RDMA off
-/// but cannot turn it on without the router-level transport mode / env.
+/// gateway exporter is up and the worker advertises it can pull. The capability
+/// gate keeps SMG from emitting a `remote` payload to a worker that would reject
+/// it, and is the per-worker opt-out (a worker that shouldn't RDMA reports
+/// `supports_rdma_pull=false`).
+///
+/// The exporter is a process-wide resource built once the RDMA lane is enabled
+/// (router transport mode `rdma`, `SMG_MM_TENSOR_TRANSPORT=rdma`, or the legacy
+/// `SMG_MM_PIXEL_RDMA`). Gating on its presence — rather than the per-request
+/// transport mode — matches TokenSpeed and honors every way the lane is enabled.
 pub(super) fn resolve_mm_rdma_enabled(workers: Option<&WorkerSelection>) -> bool {
-    let mode =
-        worker_transport_mode_override(workers).unwrap_or_else(|| mm_transport_defaults().mode);
-    mode == TransportMode::Rdma
-        && mm_rdma_exporter().is_some()
-        && worker_supports_rdma_pull(workers)
+    mm_rdma_exporter().is_some() && worker_supports_rdma_pull(workers)
 }
 
 /// Whether the request's worker advertises RDMA-pull support via the
@@ -666,8 +666,7 @@ mod tests {
     fn resolve_mm_rdma_enabled_requires_exporter() {
         // Even a capable worker cannot RDMA without the gateway exporter, which is
         // never built in the default (stub) test build -> the gate stays off.
-        let workers =
-            single_worker_with_labels(&[("supports_rdma_pull", "true"), ("_mode", "unused")]);
+        let workers = single_worker_with_labels(&[("supports_rdma_pull", "true")]);
         assert!(!resolve_mm_rdma_enabled(Some(&workers)));
     }
 

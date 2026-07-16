@@ -80,6 +80,7 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-grpc-client.workspace = true
+ic-client.workspace = true
 
 # External dependencies (not in workspace)
 bincode = "1.3"

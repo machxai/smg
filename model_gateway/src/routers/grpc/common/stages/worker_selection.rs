@@ -7,13 +7,18 @@ use axum::{
     http::{HeaderMap, HeaderValue},
     response::Response,
 };
-use tracing::{error, warn};
+use ic_client::RankedReplica;
+use tracing::{debug, error, warn};
 
-use super::PipelineStage;
+use super::{
+    ic_consult::{resolve_replica_to_available_index, IcConsultant},
+    PipelineStage,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
+        common::header_utils::extract_target_worker,
         error,
         grpc::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
@@ -36,11 +41,23 @@ type EncodePrefillDecodeWorkerSelection = (
     RuntimeType,
 );
 
+/// Positional target-worker header honored by `ConsistentHashingPolicy` (mirrors
+/// the private constant in `routers::common::header_utils`, kept in sync there).
+const TARGET_WORKER_HEADER: &str = "x-smg-target-worker";
+
+/// The only policy that honors the target-worker mechanism the IC hint reuses.
+/// When any other policy is active, the IC consult is skipped entirely.
+const CONSISTENT_HASHING_POLICY: &str = "consistent_hashing";
+
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
+    /// Optional Inference Cache (IC) consult. `None` → IC disabled and
+    /// worker selection is unchanged. Only the regular (single-worker) path
+    /// consults it.
+    ic_consultant: Option<Arc<IcConsultant>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +80,16 @@ impl WorkerSelectionStage {
             worker_registry,
             policy_registry,
             mode,
+            ic_consultant: None,
         }
+    }
+
+    /// Attach an IC consultant. A `None` argument (IC disabled) is a no-op, so
+    /// call sites can pass the optional consultant through unconditionally.
+    #[must_use]
+    pub fn with_ic_consultant(mut self, ic_consultant: Option<Arc<IcConsultant>>) -> Self {
+        self.ic_consultant = ic_consultant;
+        self
     }
 }
 
@@ -94,7 +120,11 @@ impl PipelineStage for WorkerSelectionStage {
         let model_id = ctx.input.model_id.as_str();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers) {
+                // Time-boxed IC consult (fail-open): produces a ranked hint the
+                // single-worker path applies via the target-worker mechanism.
+                let ic_hint = self.maybe_consult_ic(model_id, headers, ids).await;
+                match self.select_single_worker(model_id, text, tokens, headers, ic_hint.as_deref())
+                {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         error!(
@@ -214,12 +244,47 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
 }
 
 impl WorkerSelectionStage {
+    /// Time-boxed Inference Cache consult for the regular path.
+    ///
+    /// Returns a ranked replica hint, or `None` to route with the normal policy.
+    /// The consult is skipped (no RPC) unless IC is configured, `token_ids`
+    /// exist, the active policy honors the target-worker mechanism the hint
+    /// reuses (`consistent_hashing`), and the caller hasn't already pinned a
+    /// target. Everything past that gate is fail-open inside [`IcConsultant`].
+    async fn maybe_consult_ic(
+        &self,
+        model_id: &str,
+        headers: Option<&HeaderMap>,
+        token_ids: &[u32],
+    ) -> Option<Vec<RankedReplica>> {
+        let consultant = self.ic_consultant.as_ref()?;
+
+        if token_ids.is_empty() {
+            return None;
+        }
+
+        // The hint is applied via the target-worker mechanism, which only the
+        // consistent_hashing policy honors — skip the RPC for any other policy.
+        if self.policy_registry.get_policy_or_default(model_id).name() != CONSISTENT_HASHING_POLICY
+        {
+            return None;
+        }
+
+        // Respect an explicit caller-pinned target — never override it.
+        if extract_target_worker(headers).is_some() {
+            return None;
+        }
+
+        consultant.consult(model_id, token_ids).await
+    }
+
     fn select_single_worker(
         &self,
         model_id: &str,
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
+        ic_hint: Option<&[RankedReplica]>,
     ) -> Option<Arc<dyn Worker>> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -251,19 +316,54 @@ impl WorkerSelectionStage {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        // Select worker via the registry (applies the routing-key sticky override
-        // when enabled; otherwise delegates to the configured policy).
-        let idx = self.policy_registry.select_worker(
-            &policy,
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-                leg: WorkerLeg::Single,
-            },
-        )?;
+        // IC hint (fail-open): resolve replica_id -> positional index into
+        // `available`, inject the target-worker header, and let the policy honor
+        // it — reusing the exact `x-smg-target-worker` code path. Any miss (no
+        // resolvable/selectable worker) falls through to normal selection below;
+        // the consult is advisory and must never fail routing.
+        let mut idx = None;
+        if let Some(target_idx) =
+            ic_hint.and_then(|ranked| resolve_replica_to_available_index(ranked, &available))
+        {
+            if let Some(injected) = inject_target_worker(headers, target_idx) {
+                idx = self.policy_registry.select_worker(
+                    &policy,
+                    &available,
+                    &SelectWorkerInfo {
+                        request_text: text,
+                        tokens,
+                        headers: Some(&injected),
+                        hash_ring: hash_ring.clone(),
+                        leg: WorkerLeg::Single,
+                    },
+                );
+                if idx.is_some() {
+                    debug!(
+                        model_id = %model_id,
+                        target_idx,
+                        "IC hint honored via target-worker mechanism"
+                    );
+                }
+            }
+        }
+
+        // Normal selection when IC is disabled / missed / didn't resolve: via the
+        // registry (applies the routing-key sticky override when enabled;
+        // otherwise delegates to the configured policy).
+        let idx = match idx {
+            Some(i) => i,
+            None => self.policy_registry.select_worker(
+                &policy,
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring,
+                    leg: WorkerLeg::Single,
+                },
+            )?,
+        };
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -653,4 +753,47 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Clone the caller's headers (if any) and pin routing to `target_idx` via the
+/// internal `x-smg-target-worker` mechanism. Returns `None` only if the index
+/// can't be encoded as a header value — unreachable for a `usize`, but keeps the
+/// IC path fail-open by construction.
+fn inject_target_worker(headers: Option<&HeaderMap>, target_idx: usize) -> Option<HeaderMap> {
+    let mut map = headers.cloned().unwrap_or_default();
+    let value = HeaderValue::from_str(&target_idx.to_string()).ok()?;
+    map.insert(TARGET_WORKER_HEADER, value);
+    Some(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_target_worker_sets_positional_header() {
+        let map = inject_target_worker(None, 3).expect("encodable index");
+        assert_eq!(
+            map.get(TARGET_WORKER_HEADER).and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+        // The injected header is exactly what `extract_target_worker` reads back.
+        assert_eq!(extract_target_worker(Some(&map)), Some("3"));
+    }
+
+    #[test]
+    fn inject_target_worker_preserves_existing_headers_and_overrides_target() {
+        let mut original = HeaderMap::new();
+        original.insert("x-smg-routing-key", HeaderValue::from_static("sess-1"));
+        original.insert(TARGET_WORKER_HEADER, HeaderValue::from_static("0"));
+
+        let map = inject_target_worker(Some(&original), 5).expect("encodable index");
+
+        // Unrelated headers survive; the target is replaced with the IC index.
+        assert_eq!(
+            map.get("x-smg-routing-key").and_then(|v| v.to_str().ok()),
+            Some("sess-1")
+        );
+        assert_eq!(extract_target_worker(Some(&map)), Some("5"));
+    }
 }

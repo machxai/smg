@@ -154,6 +154,10 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+    /// Inference Cache (IC) route-lookup consult. `None` (the default) disables
+    /// it and leaves routing unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ic_lookup: Option<IcLookupConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -757,6 +761,46 @@ impl Default for TraceConfig {
     }
 }
 
+/// Inference Cache (IC) route-lookup configuration.
+///
+/// When present, the gRPC regular pipeline consults IC's `LookupRoute` with the
+/// request's own `token_ids` before worker selection and obeys the returned best
+/// replica. Absent (the default) → IC is disabled and routing is unchanged.
+///
+/// Fail-open by construction: any miss / timeout / error leaves selection to the
+/// configured policy. The hint is only applied under the `consistent_hashing`
+/// policy, which honors the internal target-worker mechanism the consult reuses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IcLookupConfig {
+    /// IC gRPC endpoint, e.g. `http://inference-cache:9100` (also accepts
+    /// `grpc://` / `grpcs://`, normalized to `http(s)://`).
+    pub endpoint: String,
+    /// Tenant identity sent on every lookup. Engine routing config, not derived
+    /// from the request in this slice — see the per-request tenant seam in
+    /// `routers::grpc::common::stages::ic_consult`.
+    #[serde(default = "default_ic_tenant_id")]
+    pub tenant_id: String,
+    /// Engine-defined hash-scheme compatibility tag forwarded to IC.
+    #[serde(default = "default_ic_hash_scheme")]
+    pub hash_scheme: String,
+    /// Hard per-lookup deadline in milliseconds. Bounds IC's time on the
+    /// critical path; on expiry the router fails open to its policy.
+    #[serde(default = "default_ic_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_ic_tenant_id() -> String {
+    "default".to_string()
+}
+
+fn default_ic_hash_scheme() -> String {
+    "default".to_string()
+}
+
+fn default_ic_timeout_ms() -> u64 {
+    15
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -822,6 +866,7 @@ impl Default for RouterConfig {
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
+            ic_lookup: None,
             server_cert: None,
             server_key: None,
         }

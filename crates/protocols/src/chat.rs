@@ -199,7 +199,13 @@ pub struct ChatCompletionRequest {
     /// Cache key for prompts (beta feature)
     pub prompt_cache_key: Option<String>,
 
-    /// Effort level for reasoning models (low, medium, high)
+    /// Effort level for reasoning models.
+    ///
+    /// OpenAI-compatible callers normally send a named string, while some
+    /// model integrations accept a numeric value. Keep the public Rust shape
+    /// as a string for compatibility, but accept either JSON representation at
+    /// the HTTP boundary; model-specific normalization happens in the gateway.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
     pub reasoning_effort: Option<String>,
 
     /// An object specifying the format that the model must output
@@ -339,6 +345,21 @@ pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<
     match reasoning_effort {
         Some("none") | Some("minimal") => Some(false),
         _ => None,
+    }
+}
+
+fn deserialize_reasoning_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(serde::de::Error::custom(
+            "reasoning_effort must be a string, number, or null",
+        )),
     }
 }
 
@@ -803,6 +824,31 @@ mod tests {
         // Unspecified / unknown -> defer.
         assert_eq!(thinking_from_reasoning_effort(None), None);
         assert_eq!(thinking_from_reasoning_effort(Some("bogus")), None);
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_scalar_json_and_rejects_other_types() {
+        for (value, expected) in [
+            (json!("high"), Some("high")),
+            (json!(0.2), Some("0.2")),
+            (json!(0.99), Some("0.99")),
+            (Value::Null, None),
+        ] {
+            let request = request_with_output_fields(&[("reasoning_effort", value)]);
+            assert_eq!(request.reasoning_effort.as_deref(), expected);
+        }
+
+        for value in [json!(true), json!([]), json!({"level": "high"})] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["reasoning_effort"] = value;
+            let error = serde_json::from_value::<ChatCompletionRequest>(request).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("reasoning_effort must be a string, number, or null"));
+        }
     }
 
     #[test]

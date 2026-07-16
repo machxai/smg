@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use llm_multimodal::{MediaContentPart, Modality, ModelMetadata};
+use llm_multimodal::{MediaContentPart, MediaPartOrder, Modality, ModelMetadata};
 use llm_tokenizer::TokenizerTrait;
 
 use super::config::MultimodalComponents;
@@ -141,6 +141,36 @@ pub(crate) async fn prepare_placeholder_tokens(
     }
 
     Ok(placeholders)
+}
+
+/// Resolve the media-part ordering for a model from the same registry that owns
+/// its placeholder/prompt logic. Falls back to vLLM-compatible media-first when
+/// the model matches no spec.
+pub(crate) async fn resolve_media_part_order(
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+) -> MediaPartOrder {
+    let model_config = match components
+        .config_registry
+        .get_or_load(tokenizer_id, tokenizer_source)
+        .await
+    {
+        Ok(config) => config,
+        Err(_) => return MediaPartOrder::MediaFirst,
+    };
+    let metadata = ModelMetadata {
+        model_id,
+        tokenizer,
+        config: &model_config.config,
+    };
+    components
+        .model_registry
+        .lookup(&metadata)
+        .map(|spec| spec.media_part_order())
+        .unwrap_or(MediaPartOrder::MediaFirst)
 }
 
 /// Verify a rendered/tokenized multimodal prompt contains exactly one

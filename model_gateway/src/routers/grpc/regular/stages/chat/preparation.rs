@@ -49,6 +49,29 @@ impl ChatPreparationStage {
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
+        // Resolve media-part ordering from the model registry so it stays owned
+        // by the per-model spec. Falls back to vLLM-compatible media-first when
+        // the model has no multimodal components or matches no spec.
+        let model_id = ctx.input.model_id.as_str();
+        let tokenizer_entry = ctx
+            .components
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+        let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
+            (Some(mm_components), Some(entry)) => {
+                multimodal::resolve_media_part_order(
+                    model_id,
+                    &*tokenizer,
+                    mm_components,
+                    &entry.id,
+                    &entry.source,
+                )
+                .await
+            }
+            _ => llm_multimodal::MediaPartOrder::MediaFirst,
+        };
+
         // Normalize media once. The same plan drives placeholder resolution,
         // rendering, fetching, preprocessing, and final count validation.
         let media_plan = multimodal::media_plan_chat(&request.messages);
@@ -56,14 +79,8 @@ impl ChatPreparationStage {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
             let model_id = ctx.input.model_id.as_str();
-            let entry = ctx
-                .components
-                .tokenizer_registry
-                .get_by_name(model_id)
-                .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
-
-            let (tokenizer_id, tokenizer_source) = match entry {
-                Some(e) => (e.id.clone(), e.source.clone()),
+            let (tokenizer_id, tokenizer_source) = match tokenizer_entry {
+                Some(e) => (e.id, e.source),
                 None => {
                     error!(
                         function = "ChatPreparationStage::execute",
@@ -125,6 +142,7 @@ impl ChatPreparationStage {
             &body_ref,
             &*tokenizer,
             placeholder_tokens.as_ref(),
+            media_order,
         ) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -236,20 +254,32 @@ impl ChatPreparationStage {
             None
         };
 
-        // Derive skip_special_tokens from constraint type:
+        let preserve_reasoning_special_tokens = request.separate_reasoning
+            && utils::reasoning_parser_requires_special_tokens(
+                &ctx.components.reasoning_parser_factory,
+                ctx.components.configured_reasoning_parser.as_deref(),
+                &request.model,
+            );
+
+        // Derive skip_special_tokens from parser and constraint type:
+        // - typed reasoning parsers need their control tokens preserved
         // - json_schema: backend forces JSON, no trigger tokens to preserve
         // - structural_tag or no constraint (auto): parser needs trigger tokens
-        let skip_special_tokens = match &tool_call_constraint {
-            Some(c) if c.is_json_schema() => request.skip_special_tokens,
-            _ if request.tools.is_some()
-                && !matches!(
-                    request.tool_choice,
-                    Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) =>
-            {
-                false
+        let skip_special_tokens = if preserve_reasoning_special_tokens {
+            false
+        } else {
+            match &tool_call_constraint {
+                Some(c) if c.is_json_schema() => request.skip_special_tokens,
+                _ if request.tools.is_some()
+                    && !matches!(
+                        request.tool_choice,
+                        Some(ToolChoice::Value(ToolChoiceValue::None))
+                    ) =>
+                {
+                    false
+                }
+                _ => request.skip_special_tokens,
             }
-            _ => request.skip_special_tokens,
         };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)

@@ -9,7 +9,7 @@ use std::{
 use anyhow::anyhow;
 use axum::response::Response;
 use bytes::Bytes;
-use llm_multimodal::Modality;
+use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
@@ -166,10 +166,45 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
 }
 
 /// Process messages based on content format for ANY message type
+#[cfg(test)]
 pub(crate) fn process_content_format(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
+) -> Result<Vec<Value>, String> {
+    process_content_format_with_order(
+        messages,
+        content_format,
+        placeholder_tokens,
+        MediaPartOrder::MediaFirst,
+    )
+}
+
+const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+
+/// Merge the top-level `reasoning_effort` with any request `chat_template_kwargs`,
+/// forwarding the effort verbatim. The chat template owns level→value mapping,
+/// defaulting, and validation; an explicit `chat_template_kwargs` entry wins.
+fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+    let mut combined = HashMap::with_capacity(kwargs_capacity);
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined.insert(
+            REASONING_EFFORT_KEY.to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        combined.extend(template_kwargs.clone());
+    }
+    combined
+}
+
+fn process_content_format_with_order(
+    messages: &[ChatMessage],
+    content_format: ChatTemplateContentFormat,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
 ) -> Result<Vec<Value>, String> {
     messages
         .iter()
@@ -178,17 +213,22 @@ pub(crate) fn process_content_format(
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
-                // Ensure assistant messages always have a content key.
-                // skip_serializing_none omits content when None, but chat templates
-                // expect `message['content'] is none` to work (key present, value null/empty).
+                // skip_serializing_none omits content when None; restore it as
+                // `null` — the OpenAI-faithful representation for a tool-call-only
+                // assistant turn — so the chat template renders it correctly.
                 if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
                     && !obj.contains_key("content")
                 {
-                    obj.insert("content".to_string(), Value::String(String::new()));
+                    obj.insert("content".to_string(), Value::Null);
                 }
 
                 if let Some(content_value) = obj.get_mut("content") {
-                    transform_content_field(content_value, content_format, placeholder_tokens)?;
+                    transform_content_field(
+                        content_value,
+                        content_format,
+                        placeholder_tokens,
+                        media_order,
+                    )?;
                 }
             }
 
@@ -204,23 +244,15 @@ pub(crate) fn process_content_format(
 /// public preprocessing bindings do not have model metadata, so their legacy
 /// `None` path continues to omit media parts.
 ///
-/// Media parts are always emitted BEFORE text, matching vLLM's default
-/// (`interleave_mm_strings=false`), which prepends media placeholders to the
-/// front of the prompt for every model. This is required for VQA accuracy:
-/// the harness sends `[text, image]` and image-after-question measurably
-/// degrades grounding (e.g. MMBench answers flip vs. image-first).
-///
-/// TODO(interleave): vLLM also supports `interleave_mm_strings=true` (opt-in,
-/// only with `--chat-template-content-format=string`), where placeholders stay
-/// in their authored position so users can fully interleave media within text.
-/// We currently always hoist media to the front and do not expose that opt-out.
-/// If/when we need interleaved prompts, thread an `interleave` flag through
-/// `process_content_format` (and the router config) and skip the reordering
-/// below when it is set, leaving the parts in their original order.
+/// Media parts are emitted before text by default, matching vLLM's
+/// `interleave_mm_strings=false` behavior and preserving existing VQA behavior.
+/// TML/Inkling opts into authored order because part order is protocol-visible
+/// in its canonical renderer.
 fn transform_content_field(
     content_value: &mut Value,
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
 ) -> Result<(), String> {
     let Some(content_array) = content_value.as_array() else {
         return Ok(()); // Not multimodal, keep as-is
@@ -228,13 +260,12 @@ fn transform_content_field(
 
     match content_format {
         ChatTemplateContentFormat::String => {
-            // Extract text parts; replace media parts with placeholders. Media
-            // placeholders are emitted FIRST (before text), matching vLLM's
-            // `_get_full_multimodal_text_prompt` ("always add missing
-            // placeholders at the front"). Placing the image after the question
-            // text measurably degrades VQA accuracy (MMBench answers flip).
+            // Replace media parts with placeholders. The default branch builds
+            // separate media/text buckets for vLLM-compatible front placement;
+            // the TML branch appends each rendered part as it is encountered.
             let mut media_parts: Vec<String> = Vec::new();
             let mut text_parts: Vec<String> = Vec::new();
+            let mut authored_parts: Vec<String> = Vec::new();
             for part in content_array {
                 let Some(obj) = part.as_object() else {
                     continue;
@@ -242,7 +273,10 @@ fn transform_content_field(
                 match obj.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
-                            text_parts.push(t.to_string());
+                            match media_order {
+                                MediaPartOrder::MediaFirst => text_parts.push(t.to_string()),
+                                MediaPartOrder::Authored => authored_parts.push(t.to_string()),
+                            }
                         }
                     }
                     Some(type_name @ ("image_url" | "video_url" | "audio_url" | "input_audio")) => {
@@ -257,14 +291,24 @@ fn transform_content_field(
                                 "missing {modality} placeholder for string-format chat template"
                             )
                         })?;
-                        media_parts.push(placeholder.to_string());
+                        match media_order {
+                            MediaPartOrder::MediaFirst => {
+                                media_parts.push(placeholder.to_string());
+                            }
+                            MediaPartOrder::Authored => {
+                                authored_parts.push(placeholder.to_string());
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
 
-            if !media_parts.is_empty() || !text_parts.is_empty() {
-                let ordered: Vec<String> = media_parts.into_iter().chain(text_parts).collect();
+            let ordered: Vec<String> = match media_order {
+                MediaPartOrder::MediaFirst => media_parts.into_iter().chain(text_parts).collect(),
+                MediaPartOrder::Authored => authored_parts,
+            };
+            if !ordered.is_empty() {
                 *content_value = Value::String(ordered.join("\n"));
             }
         }
@@ -285,22 +329,25 @@ fn transform_content_field(
                 })
                 .collect();
 
-            // Place media parts before the remaining (text) parts, matching
-            // vLLM's front placement. The chat template renders parts in order,
-            // so an OpenAI request like [text, image] would otherwise put the
-            // image AFTER the whole question — which measurably hurts visual
-            // grounding (MMBench answers flip vs. image-first). `partition` is
-            // stable, so relative order within media and within text is kept.
-            let (mut media, rest): (Vec<Value>, Vec<Value>) =
-                processed_parts.into_iter().partition(|p| {
-                    matches!(
-                        p.get("type").and_then(|t| t.as_str()),
-                        Some("image") | Some("video") | Some("audio")
-                    )
-                });
-            media.extend(rest);
+            // The default branch places media before the remaining parts,
+            // matching vLLM front placement. `partition` is stable, so relative
+            // order within media and within text is kept. TML skips partitioning.
+            let ordered_parts = match media_order {
+                MediaPartOrder::Authored => processed_parts,
+                MediaPartOrder::MediaFirst => {
+                    let (mut media, rest): (Vec<Value>, Vec<Value>) =
+                        processed_parts.into_iter().partition(|p| {
+                            matches!(
+                                p.get("type").and_then(|t| t.as_str()),
+                                Some("image") | Some("video") | Some("audio")
+                            )
+                        });
+                    media.extend(rest);
+                    media
+                }
+            };
 
-            *content_value = Value::Array(media);
+            *content_value = Value::Array(ordered_parts);
         }
     }
 
@@ -382,19 +429,29 @@ pub fn process_chat_messages(
         placeholders.insert(Modality::Image, token.to_string());
         placeholders
     });
-    process_chat_messages_with_placeholders(request, tokenizer, placeholder_tokens.as_ref())
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens.as_ref(),
+        MediaPartOrder::MediaFirst,
+    )
 }
 
 pub(crate) fn process_chat_messages_with_placeholders(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
 ) -> Result<ProcessedMessages, String> {
     let formatted_text = {
         // Get content format and transform messages accordingly
         let content_format = tokenizer.chat_template_content_format();
-        let mut transformed_messages =
-            process_content_format(&request.messages, content_format, placeholder_tokens)?;
+        let mut transformed_messages = process_content_format_with_order(
+            &request.messages,
+            content_format,
+            placeholder_tokens,
+            media_order,
+        )?;
 
         // Process tool call arguments in assistant messages
         process_tool_call_arguments(&mut transformed_messages)?;
@@ -412,26 +469,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             .transpose()
             .map_err(|e| format!("Failed to serialize tools: {e}"))?;
 
-        let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-        let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
-
-        // Add reasoning_effort if present (like Python does): some templates read
-        // it as a *level*. The thinking on/off projection is applied separately
-        // via `ChatTemplateParams.thinking` below, so the tokenizer sets the
-        // model's own toggle key.
-        if let Some(reasoning_effort) = &request.reasoning_effort {
-            combined_template_kwargs.insert(
-                "reasoning_effort".to_string(),
-                Value::String(reasoning_effort.clone()),
-            );
-        }
-
-        // Add any additional template kwargs from request
-        if let Some(template_kwargs) = &request.chat_template_kwargs {
-            for (key, value) in template_kwargs {
-                combined_template_kwargs.insert(key.clone(), value.clone());
-            }
-        }
+        let combined_template_kwargs = build_chat_template_kwargs(request);
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None
@@ -712,7 +750,7 @@ pub(crate) fn parse_finish_reason(
 mod tests {
     use llm_tokenizer::chat_template::ChatTemplateContentFormat;
     use openai_protocol::{
-        chat::{ChatMessage, MessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
     };
     use serde_json::json;
@@ -1172,6 +1210,121 @@ mod tests {
         assert_eq!(arr[1], json!({"type": "image"}));
         assert_eq!(arr[2]["text"], "a");
         assert_eq!(arr[3]["text"], "b");
+    }
+
+    #[test]
+    fn test_tml_preserves_authored_multipart_order_openai() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "question".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "image".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let expected = json!([
+            {"type": "text", "text": "question"},
+            {"type": "image"}
+        ]);
+        let result = process_content_format_with_order(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+        assert_eq!(result[0]["content"], expected);
+    }
+
+    #[test]
+    fn test_absent_assistant_content_renders_null() {
+        let messages = vec![ChatMessage::Assistant {
+            content: None,
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }];
+
+        let result = process_content_format_with_order(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert!(result[0]["content"].is_null());
+    }
+
+    #[test]
+    fn test_tml_preserves_authored_multipart_order_string() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "question".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "image".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+        let tokens = placeholders(&[(Modality::Image, "<image>")]);
+
+        let result = process_content_format_with_order(
+            &messages,
+            ChatTemplateContentFormat::String,
+            Some(&tokens),
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+
+        assert_eq!(result[0]["content"], "question\n<image>");
+    }
+
+    fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "inkling-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_is_forwarded_verbatim() {
+        // The chat template owns level->value mapping, defaulting, and validation;
+        // the router forwards the string and omits it when absent so the template
+        // applies its own default.
+        let kwargs = build_chat_template_kwargs(&effort_request(Some("high")));
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+
+        let kwargs = build_chat_template_kwargs(&effort_request(None));
+        assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
+    }
+
+    #[test]
+    fn chat_template_kwargs_override_top_level_effort() {
+        let mut request = effort_request(Some("high"));
+        request.chat_template_kwargs = Some(HashMap::from([
+            (REASONING_EFFORT_KEY.to_string(), json!("low")),
+            ("custom".to_string(), json!(true)),
+        ]));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+        assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
     }
 
     /// End-to-end: run a real MMBench-shaped `[text, image]` message through the

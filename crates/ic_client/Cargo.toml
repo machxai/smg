@@ -1,0 +1,37 @@
+[package]
+name = "ic-client"
+version = "0.1.0"
+edition = "2021"
+description = "Tonic gRPC client for the Inference Cache (IC) routing control plane"
+license = "Apache-2.0"
+repository = "https://github.com/lightseekorg/smg"
+keywords = ["grpc", "inference-cache", "routing", "llm"]
+categories = ["api-bindings"]
+
+[lib]
+name = "ic_client"
+
+[dependencies]
+# Async runtime — `time` is needed for the client-side lookup deadline.
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+# gRPC / protobuf
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
+prost-build = "0.14.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net"] }
+futures.workspace = true
+
+[lints]
+workspace = true

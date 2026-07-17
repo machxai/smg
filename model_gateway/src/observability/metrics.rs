@@ -403,6 +403,21 @@ pub(crate) fn init_metrics() {
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
 
+    // Inference Cache (IC) route consult (gRPC regular path). See
+    // routers::grpc::common::stages::ic_consult. Zero-cost when IC is disabled.
+    describe_counter!(
+        "smg_ic_consult_total",
+        "IC route-consult outcomes by outcome (hit/miss/timeout/error/skipped)"
+    );
+    describe_counter!(
+        "smg_ic_routing_decision_total",
+        "Final routing decision on IC-consulted requests by decision (obeyed_ic/fell_back)"
+    );
+    describe_histogram!(
+        "smg_ic_consult_duration_seconds",
+        "IC LookupRoute server-measured lookup latency (from LookupResult.lookup_latency_us)"
+    );
+
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
 
@@ -564,6 +579,17 @@ pub mod metrics_labels {
     pub const ERROR_BACKEND: &str = "backend_error";
     pub const ERROR_VALIDATION: &str = "validation_error";
     pub const ERROR_INTERNAL: &str = "internal_error";
+
+    // Inference Cache (IC) route-consult outcomes (smg_ic_consult_total)
+    pub const IC_CONSULT_HIT: &str = "hit";
+    pub const IC_CONSULT_MISS: &str = "miss";
+    pub const IC_CONSULT_TIMEOUT: &str = "timeout";
+    pub const IC_CONSULT_ERROR: &str = "error";
+    pub const IC_CONSULT_SKIPPED: &str = "skipped";
+
+    // Inference Cache (IC) routing-decision attribution (smg_ic_routing_decision_total)
+    pub const IC_DECISION_OBEYED: &str = "obeyed_ic";
+    pub const IC_DECISION_FELL_BACK: &str = "fell_back";
 }
 
 /// SMG Metrics helper struct for the new layered metrics architecture.
@@ -1127,6 +1153,45 @@ impl Metrics {
             "branch" => branch
         )
         .increment(1);
+    }
+
+    // ========================================================================
+    // Inference Cache (IC) route consult (gRPC regular path)
+    //
+    // See routers::grpc::common::stages::ic_consult. Every counter here is
+    // zero-cost when IC is disabled: with no consultant configured, the consult
+    // path returns before recording anything.
+    // ========================================================================
+
+    /// Record one IC route-consult outcome (see `metrics_labels::IC_CONSULT_*`).
+    pub fn record_ic_consult(outcome: &'static str) {
+        counter!(
+            "smg_ic_consult_total",
+            "outcome" => outcome
+        )
+        .increment(1);
+    }
+
+    /// Record the final routing decision on an IC-consulted request (see
+    /// `metrics_labels::IC_DECISION_*`): whether IC's replica was obeyed or the
+    /// request fell back to the consistent-hashing policy.
+    pub fn record_ic_routing_decision(decision: &'static str) {
+        counter!(
+            "smg_ic_routing_decision_total",
+            "decision" => decision
+        )
+        .increment(1);
+    }
+
+    /// Record the IC server-measured lookup latency
+    /// (`LookupResult.lookup_latency_us`). Non-positive values (no measurement
+    /// available) are ignored.
+    pub fn record_ic_consult_latency(lookup_latency_us: i64) {
+        if lookup_latency_us <= 0 {
+            return;
+        }
+        histogram!("smg_ic_consult_duration_seconds")
+            .record(lookup_latency_us as f64 / 1_000_000.0);
     }
 
     /// Set running requests per worker
@@ -2101,6 +2166,73 @@ mod tests {
         assert!(
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    // ========================================================================
+    // Inference Cache (IC) consult metric tests
+    // ========================================================================
+
+    #[test]
+    fn test_record_ic_consult_counts_by_outcome() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_HIT);
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_HIT);
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_MISS);
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_TIMEOUT);
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_ERROR);
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_SKIPPED);
+        });
+        assert!(
+            rendered.contains(r#"smg_ic_consult_total{outcome="hit"} 2"#),
+            "hit outcome wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_ic_consult_total{outcome="miss"} 1"#),
+            "miss outcome wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_ic_consult_total{outcome="timeout"} 1"#),
+            "timeout outcome wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_ic_consult_total{outcome="error"} 1"#),
+            "error outcome wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_ic_consult_total{outcome="skipped"} 1"#),
+            "skipped outcome wrong; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_ic_routing_decision_counts_by_decision() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_OBEYED);
+            Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_FELL_BACK);
+            Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_FELL_BACK);
+        });
+        assert!(
+            rendered.contains(r#"smg_ic_routing_decision_total{decision="obeyed_ic"} 1"#),
+            "obeyed_ic decision wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_ic_routing_decision_total{decision="fell_back"} 2"#),
+            "fell_back decision wrong; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_ic_consult_latency_emits_histogram_and_ignores_nonpositive() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_ic_consult_latency(1500); // 1.5 ms — recorded
+            Metrics::record_ic_consult_latency(0); // no measurement — ignored
+            Metrics::record_ic_consult_latency(-1); // no measurement — ignored
+        });
+        // Exactly one observation is recorded; the non-positive ones are dropped.
+        assert!(
+            rendered.contains("smg_ic_consult_duration_seconds_count 1"),
+            "ic consult latency histogram should have one observation; rendered:\n{rendered}"
         );
     }
 }

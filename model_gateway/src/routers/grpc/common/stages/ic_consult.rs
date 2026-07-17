@@ -17,10 +17,14 @@
 
 use std::{sync::Arc, time::Duration};
 
-use ic_client::{IcClient, IcClientError, RankedReplica};
+use ic_client::{reason_code, IcClient, IcClientError, RankedReplica};
 use tracing::debug;
 
-use crate::{config::IcLookupConfig, worker::Worker};
+use crate::{
+    config::IcLookupConfig,
+    observability::metrics::{metrics_labels, Metrics},
+    worker::Worker,
+};
 
 /// Wraps a lazily-connected IC gRPC client plus the per-deployment lookup
 /// parameters (tenant, hash scheme, deadline).
@@ -88,6 +92,18 @@ impl IcConsultant {
 
         match result {
             Ok(hint) if hint.is_no_hint() => {
+                // A response arrived but carries no usable replica: NO_HINT /
+                // empty ranking, or a server-side TIMEOUT reason (distinct from a
+                // client-side deadline, handled in the `Err` arm below). This
+                // consult definitively falls back to the policy.
+                Metrics::record_ic_consult_latency(hint.lookup_latency_us);
+                let outcome = if hint.reason_code == reason_code::TIMEOUT {
+                    metrics_labels::IC_CONSULT_TIMEOUT
+                } else {
+                    metrics_labels::IC_CONSULT_MISS
+                };
+                Metrics::record_ic_consult(outcome);
+                Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_FELL_BACK);
                 debug!(
                     model_id,
                     reason = %hint.reason_code,
@@ -96,6 +112,12 @@ impl IcConsultant {
                 None
             }
             Ok(hint) => {
+                // A usable hint was returned. Whether it is actually obeyed
+                // depends on the replica-identity resolution at the call site
+                // (`select_single_worker`), which records the terminal
+                // hit/miss outcome and routing decision. Here we only record the
+                // observed server-side lookup latency.
+                Metrics::record_ic_consult_latency(hint.lookup_latency_us);
                 debug!(
                     model_id,
                     reason = %hint.reason_code,
@@ -106,6 +128,14 @@ impl IcConsultant {
                 Some(hint.replicas)
             }
             Err(err) => {
+                // A client-side deadline is a timeout; every other transport /
+                // RPC failure is an error. Both fail open to the policy.
+                let outcome = match err {
+                    IcClientError::DeadlineExceeded(_) => metrics_labels::IC_CONSULT_TIMEOUT,
+                    _ => metrics_labels::IC_CONSULT_ERROR,
+                };
+                Metrics::record_ic_consult(outcome);
+                Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_FELL_BACK);
                 debug!(
                     model_id,
                     error = %err,

@@ -634,6 +634,57 @@ Prefix hash policy execution branch counts for routing decisions.
 
 ---
 
+## Inference Cache (IC) Consult Metrics
+
+Gateway-side observability for the time-boxed IC route consult on the gRPC
+regular path (`RouterConfig::ic_lookup`). All three are zero-cost when IC is
+disabled — with no consultant configured, nothing is recorded.
+
+### `smg_ic_consult_total`
+
+IC route-consult outcomes. Recorded once per consult (when IC is enabled).
+
+| Type | Labels |
+|------|--------|
+| Counter | `outcome` |
+
+`outcome` values:
+
+- `hit` — IC returned a usable replica that was obeyed (routed to it).
+- `miss` — no usable replica: `NO_HINT` / empty response, or a returned hint that
+  resolved to no selectable available worker.
+- `timeout` — client deadline exceeded, or a server-reported `TIMEOUT` reason.
+- `error` — RPC / transport failure.
+- `skipped` — consult gate short-circuited (no tokens, non–consistent-hashing
+  policy, or a caller-pinned target); no RPC issued.
+
+### `smg_ic_routing_decision_total`
+
+Final routing decision on requests where an IC consult was actually attempted
+(the `skipped` outcomes above are excluded). This is the core
+T1-local-vs-IC-vs-fallback attribution signal for the gateway.
+
+| Type | Labels |
+|------|--------|
+| Counter | `decision` |
+
+`decision` values:
+
+- `obeyed_ic` — routed to IC's hinted replica.
+- `fell_back` — consult did not yield a usable target, so the consistent-hashing
+  policy chose (miss / timeout / error / unresolved hint).
+
+### `smg_ic_consult_duration_seconds`
+
+IC `LookupRoute` server-measured lookup latency, from
+`LookupResult.lookup_latency_us` (recorded on every response — hit or miss).
+
+| Type | Labels |
+|------|--------|
+| Histogram | _(none)_ |
+
+---
+
 ## Dashboard Queries Summary
 
 | Metric | Query |

@@ -82,6 +82,9 @@ pub(crate) struct PipelineDeps {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    /// Optional Inference Cache route consultant, attached to worker selection
+    /// on the chat/generate pipeline only. `None` → IC disabled (the default).
+    ic_consultant: Option<Arc<IcConsultant>>,
 }
 
 impl PipelineDeps {
@@ -102,6 +105,7 @@ impl PipelineDeps {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            ic_consultant: None,
         }
     }
 
@@ -118,7 +122,16 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            ic_consultant: None,
         }
+    }
+
+    /// Attach an IC consultant. A `None` argument (IC disabled) is a no-op, so
+    /// call sites can pass the optional consultant through unconditionally.
+    #[must_use]
+    pub(crate) fn with_ic_consultant(mut self, ic_consultant: Option<Arc<IcConsultant>>) -> Self {
+        self.ic_consultant = ic_consultant;
+        self
     }
 
     /// Build the chat/messages response processor pair from the configured
@@ -180,6 +193,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            ic_consultant: None,
         }
     }
 }
@@ -259,11 +273,16 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(ChatGeneratePreparationStage::new()),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
+                    Box::new(
+                        WorkerSelectionStage::new(
+                            deps.worker_registry.clone(),
+                            deps.policy_registry.clone(),
+                            worker_selection,
+                        )
+                        // IC route consult (chat/generate only; no-op when None,
+                        // and only the Regular selection path ever consults it).
+                        .with_ic_consultant(deps.ic_consultant.clone()),
+                    ),
                     Box::new(ClientAcquisitionStage),
                 ];
                 if matches!(mode, Mode::EncodePrefillDecode) {

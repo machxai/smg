@@ -21,8 +21,11 @@ use serde_json::json;
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+    common::{
+        responses::{
+            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+        },
+        stages::IcConsultant,
     },
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -354,6 +357,23 @@ impl GrpcRouter {
             multimodal,
         });
 
+        // Build the optional Inference Cache route consultant. It is
+        // disabled unless `ic_lookup` is configured; a construction error (e.g. a
+        // malformed endpoint) is logged and treated as disabled — IC must never
+        // fail router startup, and the channel connects lazily on first use.
+        let ic_consultant = ctx.router_config.ic_lookup.as_ref().and_then(|cfg| {
+            match IcConsultant::from_config(cfg) {
+                Ok(consultant) => {
+                    tracing::info!(endpoint = %cfg.endpoint, "IC route lookup enabled");
+                    Some(Arc::new(consultant))
+                }
+                Err(e) => {
+                    tracing::warn!("IC route lookup disabled: {e}");
+                    None
+                }
+            }
+        });
+
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -362,7 +382,8 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
-        );
+        )
+        .with_ic_consultant(ic_consultant);
         // Deps for the parser-free endpoints (completion/embeddings/classify).
         let pair_deps = PipelineDeps::pair(worker_registry.clone(), policy_registry.clone());
 

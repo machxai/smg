@@ -39,6 +39,10 @@ impl ConfigValidator {
             Self::validate_trace(trace_config)?;
         }
 
+        if let Some(ic_lookup) = &config.ic_lookup {
+            Self::validate_ic_lookup(ic_lookup)?;
+        }
+
         Self::validate_compatibility(config)?;
 
         let retry_cfg = config.effective_retry_config();
@@ -673,6 +677,28 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate the Inference Cache route-consult config. Only reached when
+    /// `ic_lookup` is `Some` (consult enabled); an absent config is disabled
+    /// and needs no checks.
+    fn validate_ic_lookup(ic_lookup: &IcLookupConfig) -> ConfigResult<()> {
+        if ic_lookup.endpoint.trim().is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "ic_lookup.endpoint".to_string(),
+            });
+        }
+
+        if ic_lookup.timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "ic_lookup.timeout_ms".to_string(),
+                value: ic_lookup.timeout_ms.to_string(),
+                reason: "must be > 0 (the per-lookup deadline bounds IC on the critical path)"
+                    .to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
             return Err(ConfigError::InvalidValue {
@@ -953,6 +979,67 @@ mod tests {
     #[test]
     fn valid_mesh_server_name_is_accepted() {
         assert!(validate_mesh_server_name("node-a").is_ok());
+    }
+
+    /// Base config that passes the rest of validation, so `ic_lookup` checks
+    /// are what a test's assertion actually exercises.
+    fn regular_config_with_ic_lookup(ic_lookup: Option<IcLookupConfig>) -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.ic_lookup = ic_lookup;
+        config
+    }
+
+    #[test]
+    fn ic_lookup_empty_endpoint_is_rejected() {
+        let config = regular_config_with_ic_lookup(Some(IcLookupConfig {
+            endpoint: "   ".to_string(),
+            tenant_id: "default".to_string(),
+            hash_scheme: "default".to_string(),
+            timeout_ms: 15,
+        }));
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::MissingRequired { ref field }) if field == "ic_lookup.endpoint"
+        ));
+    }
+
+    #[test]
+    fn ic_lookup_zero_timeout_is_rejected() {
+        let config = regular_config_with_ic_lookup(Some(IcLookupConfig {
+            endpoint: "http://inference-cache:9100".to_string(),
+            tenant_id: "default".to_string(),
+            hash_scheme: "default".to_string(),
+            timeout_ms: 0,
+        }));
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "ic_lookup.timeout_ms"
+        ));
+    }
+
+    #[test]
+    fn ic_lookup_valid_is_accepted() {
+        let config = regular_config_with_ic_lookup(Some(IcLookupConfig {
+            endpoint: "http://inference-cache:9100".to_string(),
+            tenant_id: "acme".to_string(),
+            hash_scheme: "vllm".to_string(),
+            timeout_ms: 15,
+        }));
+
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn ic_lookup_absent_is_accepted() {
+        let config = regular_config_with_ic_lookup(None);
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

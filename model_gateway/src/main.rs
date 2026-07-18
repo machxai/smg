@@ -6,9 +6,10 @@ use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig, TraceConfig,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, IcLookupConfig, ManualAssignmentMode,
+        MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig,
+        TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -599,6 +600,49 @@ struct CliArgs {
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
     mcp_config_path: Option<String>,
+
+    // ==================== Inference Cache (IC) Route Consult ====================
+    /// IC gRPC endpoint for route consult, e.g. http://inference-cache:9100
+    /// (grpc:// / grpcs:// are also accepted). Supplying this ENABLES the
+    /// consult path on the gRPC regular pipeline; omitting it leaves IC
+    /// disabled and routing unchanged.
+    #[arg(
+        long,
+        env = "SMG_IC_LOOKUP_ENDPOINT",
+        help_heading = "Inference Cache (IC) Route Consult"
+    )]
+    ic_lookup_endpoint: Option<String>,
+
+    /// Tenant identity sent on every IC lookup. Only used when
+    /// --ic-lookup-endpoint is set.
+    #[arg(
+        long,
+        default_value = "default",
+        env = "SMG_IC_LOOKUP_TENANT_ID",
+        help_heading = "Inference Cache (IC) Route Consult"
+    )]
+    ic_lookup_tenant_id: String,
+
+    /// Engine-defined hash-scheme compatibility tag forwarded to IC. Only used
+    /// when --ic-lookup-endpoint is set.
+    #[arg(
+        long,
+        default_value = "default",
+        env = "SMG_IC_LOOKUP_HASH_SCHEME",
+        help_heading = "Inference Cache (IC) Route Consult"
+    )]
+    ic_lookup_hash_scheme: String,
+
+    /// Hard per-lookup deadline in milliseconds. Bounds IC's time on the
+    /// critical path; on expiry the router fails open to its policy. Only used
+    /// when --ic-lookup-endpoint is set.
+    #[arg(
+        long,
+        default_value_t = 15,
+        env = "SMG_IC_LOOKUP_TIMEOUT_MS",
+        help_heading = "Inference Cache (IC) Route Consult"
+    )]
+    ic_lookup_timeout_ms: u64,
 
     // ==================== Backend ====================
     /// Backend runtime to use (auto-detected if not specified)
@@ -1342,6 +1386,18 @@ impl CliArgs {
             _ => (None, None, None),
         };
 
+        // IC route consult is opt-in: only the presence of an endpoint turns it
+        // on. Absent endpoint → None → consult disabled, routing unchanged.
+        let ic_lookup = self
+            .ic_lookup_endpoint
+            .clone()
+            .map(|endpoint| IcLookupConfig {
+                endpoint,
+                tenant_id: self.ic_lookup_tenant_id.clone(),
+                hash_scheme: self.ic_lookup_hash_scheme.clone(),
+                timeout_ms: self.ic_lookup_timeout_ms,
+            });
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1422,6 +1478,7 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .maybe_ic_lookup(ic_lookup)
             .dp_aware(self.dp_aware)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
@@ -1812,5 +1869,60 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    /// `--ic-lookup-endpoint` is the enable switch: supplying it (with the
+    /// companion flags) populates `RouterConfig::ic_lookup` with the parsed
+    /// fields, which is what the gRPC router reads to build the consultant.
+    #[test]
+    fn ic_lookup_endpoint_enables_consult_with_parsed_fields() {
+        let cli = cli_args_from(&[
+            "--ic-lookup-endpoint",
+            "http://inference-cache:9100",
+            "--ic-lookup-tenant-id",
+            "acme",
+            "--ic-lookup-hash-scheme",
+            "vllm",
+            "--ic-lookup-timeout-ms",
+            "25",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        let ic_lookup = router_config
+            .ic_lookup
+            .expect("providing --ic-lookup-endpoint must enable consult (Some)");
+        assert_eq!(ic_lookup.endpoint, "http://inference-cache:9100");
+        assert_eq!(ic_lookup.tenant_id, "acme");
+        assert_eq!(ic_lookup.hash_scheme, "vllm");
+        assert_eq!(ic_lookup.timeout_ms, 25);
+    }
+
+    /// Endpoint alone is enough to enable consult; the companion flags fall
+    /// back to their defaults, matching `IcLookupConfig`'s serde defaults.
+    #[test]
+    fn ic_lookup_endpoint_only_uses_field_defaults() {
+        let cli = cli_args_from(&["--ic-lookup-endpoint", "http://inference-cache:9100"]);
+
+        let ic_lookup = cli
+            .to_router_config(vec![], vec![])
+            .unwrap()
+            .ic_lookup
+            .expect("endpoint presence must enable consult");
+        assert_eq!(ic_lookup.tenant_id, "default");
+        assert_eq!(ic_lookup.hash_scheme, "default");
+        assert_eq!(ic_lookup.timeout_ms, 15);
+    }
+
+    /// No `--ic-lookup-endpoint` → consult stays disabled (`None`), preserving
+    /// the pre-existing default behavior where routing is unchanged.
+    #[test]
+    fn ic_lookup_absent_leaves_consult_disabled() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.ic_lookup.is_none(),
+            "without an endpoint IC consult must be disabled (None)"
+        );
     }
 }

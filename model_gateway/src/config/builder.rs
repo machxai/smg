@@ -5,9 +5,9 @@ use smg_mcp::McpConfig;
 
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
-    TokenizerCacheConfig, TraceConfig,
+    HistoryBackend, IcLookupConfig, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::ConnectionMode;
 
@@ -678,6 +678,15 @@ impl RouterConfigBuilder {
 
     pub fn maybe_tool_call_parser(mut self, parser: Option<impl Into<String>>) -> Self {
         self.config.tool_call_parser = parser.map(|p| p.into());
+        self
+    }
+
+    // ==================== Inference Cache (IC) Route Consult ====================
+
+    /// `None` (the default) leaves IC route consult disabled and routing
+    /// unchanged; `Some` enables the gRPC regular-path consult.
+    pub fn maybe_ic_lookup(mut self, ic_lookup: Option<IcLookupConfig>) -> Self {
+        self.config.ic_lookup = ic_lookup;
         self
     }
 

@@ -257,9 +257,13 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         token_ids: &[u32],
     ) -> Option<Vec<RankedReplica>> {
+        // IC not configured: zero-cost, record nothing.
         let consultant = self.ic_consultant.as_ref()?;
 
+        // Past this point IC is enabled, so a declined gate is a real consult
+        // that was skipped (no RPC issued) and worth attributing.
         if token_ids.is_empty() {
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_SKIPPED);
             return None;
         }
 
@@ -267,11 +271,13 @@ impl WorkerSelectionStage {
         // consistent_hashing policy honors — skip the RPC for any other policy.
         if self.policy_registry.get_policy_or_default(model_id).name() != CONSISTENT_HASHING_POLICY
         {
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_SKIPPED);
             return None;
         }
 
         // Respect an explicit caller-pinned target — never override it.
         if extract_target_worker(headers).is_some() {
+            Metrics::record_ic_consult(metrics_labels::IC_CONSULT_SKIPPED);
             return None;
         }
 
@@ -321,29 +327,45 @@ impl WorkerSelectionStage {
         // it — reusing the exact `x-smg-target-worker` code path. Any miss (no
         // resolvable/selectable worker) falls through to normal selection below;
         // the consult is advisory and must never fail routing.
+        //
+        // A `Some(hint)` here means IC returned a usable ranked list (the RPC-
+        // level miss/timeout/error outcomes were already recorded inside
+        // `IcConsultant::consult`). This block records the terminal outcome for
+        // such a hint: `hit`/`obeyed_ic` when it is honored, or `miss`/`fell_back`
+        // when no hinted replica maps to a selectable available worker.
         let mut idx = None;
-        if let Some(target_idx) =
-            ic_hint.and_then(|ranked| resolve_replica_to_available_index(ranked, &available))
-        {
-            if let Some(injected) = inject_target_worker(headers, target_idx) {
-                idx = self.policy_registry.select_worker(
-                    &policy,
-                    &available,
-                    &SelectWorkerInfo {
-                        request_text: text,
-                        tokens,
-                        headers: Some(&injected),
-                        hash_ring: hash_ring.clone(),
-                        leg: WorkerLeg::Single,
-                    },
-                );
-                if idx.is_some() {
-                    debug!(
-                        model_id = %model_id,
-                        target_idx,
-                        "IC hint honored via target-worker mechanism"
-                    );
+        if let Some(hint) = ic_hint {
+            let mut obeyed = false;
+            if let Some(target_idx) = resolve_replica_to_available_index(hint, &available) {
+                if let Some(injected) = inject_target_worker(headers, target_idx) {
+                    if let Some(selected) = self.policy_registry.select_worker(
+                        &policy,
+                        &available,
+                        &SelectWorkerInfo {
+                            request_text: text,
+                            tokens,
+                            headers: Some(&injected),
+                            hash_ring: hash_ring.clone(),
+                            leg: WorkerLeg::Single,
+                        },
+                    ) {
+                        debug!(
+                            model_id = %model_id,
+                            target_idx,
+                            "IC hint honored via target-worker mechanism"
+                        );
+                        idx = Some(selected);
+                        obeyed = true;
+                    }
                 }
+            }
+            if obeyed {
+                Metrics::record_ic_consult(metrics_labels::IC_CONSULT_HIT);
+                Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_OBEYED);
+            } else {
+                // IC returned replicas but none resolved to a selectable worker.
+                Metrics::record_ic_consult(metrics_labels::IC_CONSULT_MISS);
+                Metrics::record_ic_routing_decision(metrics_labels::IC_DECISION_FELL_BACK);
             }
         }
 

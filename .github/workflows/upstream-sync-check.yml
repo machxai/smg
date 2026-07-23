@@ -1,0 +1,333 @@
+# Fork-maintenance workflow. This fork carries the Inference Cache route-consult
+# client on top of an upstream (lightseekorg/smg) release tag. This job watches
+# for a newer upstream release, replays our commits onto it, and builds/tests
+# the result, so we learn about drift on a schedule instead of at merge time.
+#
+# Runner note: everything here runs on GitHub-hosted `ubuntu-latest`. The heavy
+# CI in this repo (pr-test-rust.yml and friends) targets self-hosted labels
+# (k8s-runner-cpu, k8s-runner-gpu, 4-gpu-h100, cpu-e5) that are registered to
+# the upstream org, so those jobs queue forever on a fork. Do not add a
+# self-hosted `runs-on` label to this file.
+#
+# Clippy note: a workspace-wide `cargo clippy --all-targets -D warnings` is red
+# on upstream itself, so lint gating here is scoped to the crates the fork owns.
+name: Upstream Sync Check
+
+on:
+  schedule:
+    # Weekly, Monday 06:17 UTC. Off the hour to avoid the cron stampede.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream tag to rebase onto (default: latest release tag)"
+        required: false
+        type: string
+      force_checks:
+        description: "Run the build/test/lint checks even if already on the latest tag"
+        required: false
+        default: false
+        type: boolean
+
+# Read-only: the job never pushes and never opens a PR. The rebase happens on a
+# throwaway local branch and the result is reported through the job summary, so
+# no write scope is needed. Raise this deliberately if that ever changes.
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-check
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/lightseekorg/smg.git
+  # Matches scripts/ci_install_rust.sh, which the self-hosted jobs use.
+  RUST_TOOLCHAIN: "1.95.0"
+  CARGO_TERM_COLOR: always
+  # Hosted runners are CPU- and disk-constrained compared to the self-hosted
+  # fleet: incremental artifacts are useless across ephemeral runners, and a
+  # full-debuginfo workspace build of this repo is ~4 GB of target/. Dropping
+  # both keeps link time and cache size down; nothing here needs a debugger.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  upstream-sync:
+    name: Rebase fork onto latest upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout fork main (full history)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve upstream release tag and our current base
+        id: resolve
+        env:
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent so re-runs on a warm/cached checkout behave the same.
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_URL"
+          # Keep upstream refs in their own namespaces so the fork's own tags
+          # and branches can never be mistaken for upstream's.
+          git fetch --no-tags --quiet upstream '+refs/heads/main:refs/upstream-main'
+          git fetch --no-tags --quiet upstream '+refs/tags/*:refs/upstream-tags/*'
+
+          if [ -n "$REQUESTED_REF" ]; then
+            TAG="$REQUESTED_REF"
+            git rev-parse --verify --quiet "refs/upstream-tags/$TAG^{commit}" >/dev/null || {
+              echo "::error::Requested upstream ref '$TAG' is not an upstream tag."
+              exit 1
+            }
+          else
+            # Highest release tag by version sort, ignoring pre-releases.
+            # `|| true`: `head -n 1` closes the pipe early, and an empty grep
+            # exits non-zero — neither is an error here, the emptiness check is.
+            TAG=$(git for-each-ref --sort=-v:refname \
+                    --format='%(refname:strip=2)' 'refs/upstream-tags/v*' \
+                  | grep -Ev -- '-(rc|alpha|beta|pre|dev)' \
+                  | head -n 1 || true)
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not determine an upstream release tag."
+            exit 1
+          fi
+
+          TAG_SHA=$(git rev-parse "refs/upstream-tags/$TAG^{commit}")
+          # Our patch series sits on top of some upstream commit; the merge-base
+          # with upstream main is that commit.
+          BASE_SHA=$(git merge-base HEAD refs/upstream-main)
+          PATCH_COMMITS=$(git rev-list --count "$BASE_SHA..HEAD")
+
+          if [ "$BASE_SHA" = "$TAG_SHA" ]; then
+            STATUS=up-to-date
+          else
+            STATUS=behind
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "tag_sha=$TAG_SHA"
+            echo "base_sha=$BASE_SHA"
+            echo "base_desc=$(git describe --tags --always "$BASE_SHA")"
+            echo "patch_commits=$PATCH_COMMITS"
+            echo "status=$STATUS"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Latest upstream release tag : $TAG ($TAG_SHA)"
+          echo "Our current base            : $BASE_SHA"
+          echo "Commits in our patch series : $PATCH_COMMITS"
+          echo "Status                      : $STATUS"
+
+      - name: Report up to date
+        if: steps.resolve.outputs.status == 'up-to-date'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Upstream sync: up to date"
+            echo
+            echo "The fork is already based on the latest upstream release."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Latest upstream release | \`${{ steps.resolve.outputs.tag }}\` |"
+            echo "| Our base | \`${{ steps.resolve.outputs.base_sha }}\` |"
+            echo "| Commits in our patch series | ${{ steps.resolve.outputs.patch_commits }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Everything below only runs when upstream has moved, or when a manual run
+      # explicitly asks for the checks (useful for validating this workflow).
+      - name: Rebase our commits onto the upstream tag
+        id: rebase
+        if: steps.resolve.outputs.status == 'behind' || inputs.force_checks
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -uo pipefail
+
+          git config user.name "upstream-sync-check"
+          git config user.email "upstream-sync-check@users.noreply.github.com"
+
+          # Throwaway branch: nothing here is ever pushed.
+          git checkout -q -B upstream-sync-attempt HEAD
+
+          if git rebase "refs/upstream-tags/$TAG"; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+            echo "Rebase onto $TAG is clean."
+            exit 0
+          fi
+
+          CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+          git rebase --abort || true
+
+          {
+            echo "## Upstream sync: REBASE CONFLICT"
+            echo
+            echo "Replaying the fork's commits onto upstream \`$TAG\` hit conflicts."
+            echo "No checks were run. Resolve the rebase locally:"
+            echo
+            echo '```bash'
+            echo "git fetch upstream --tags"
+            echo "git checkout -b chore/rebase-$TAG main"
+            echo "git rebase $TAG"
+            echo '```'
+            echo
+            echo "### Conflicting files"
+            echo
+            echo '```'
+            echo "${CONFLICTS:-(none reported)}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::Rebase onto upstream $TAG conflicted in: $(echo "$CONFLICTS" | tr '\n' ' ')"
+          echo "status=conflict" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Install build dependencies
+        if: steps.rebase.outputs.status == 'clean'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # protoc is required by crates/ic_client/build.rs (tonic-prost-build).
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        if: steps.rebase.outputs.status == 'clean'
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Rust cache
+        if: steps.rebase.outputs.status == 'clean'
+        # Swatinem/rust-cache v2.9.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: .
+          shared-key: upstream-sync
+          cache-all-crates: true
+          cache-on-failure: true
+
+      # Cargo.lock is gitignored in this repo, so `--locked` is not usable here.
+      - name: cargo check (workspace)
+        id: check
+        if: steps.rebase.outputs.status == 'clean'
+        run: cargo check --workspace
+
+      - name: cargo test -p ic-client
+        id: test_ic_client
+        if: steps.rebase.outputs.status == 'clean'
+        run: cargo test -p ic-client
+
+      - name: cargo test -p smg (IC consult surface)
+        id: test_smg_ic
+        if: steps.rebase.outputs.status == 'clean'
+        run: cargo test -p smg --lib -- ic_consult ic_lookup
+
+      # Scoped to fork-owned crates on purpose: a workspace-wide clippy is red
+      # on upstream itself and would make this job permanently unactionable.
+      - name: clippy -p ic-client
+        id: clippy_ic_client
+        if: steps.rebase.outputs.status == 'clean'
+        run: cargo clippy -p ic-client --all-targets -- -D warnings
+
+      - name: clippy -p smg (lib)
+        id: clippy_smg
+        if: steps.rebase.outputs.status == 'clean'
+        run: cargo clippy -p smg --lib -- -D warnings
+
+      - name: Job summary
+        if: always() && steps.rebase.outputs.status == 'clean'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          CHECK: ${{ steps.check.outcome }}
+          TEST_IC_CLIENT: ${{ steps.test_ic_client.outcome }}
+          TEST_SMG_IC: ${{ steps.test_smg_ic.outcome }}
+          CLIPPY_IC_CLIENT: ${{ steps.clippy_ic_client.outcome }}
+          CLIPPY_SMG: ${{ steps.clippy_smg.outcome }}
+        run: |
+          set -euo pipefail
+
+          icon() {
+            case "$1" in
+              success) echo "pass" ;;
+              failure) echo "**FAIL**" ;;
+              skipped) echo "skipped" ;;
+              *) echo "${1:-not run}" ;;
+            esac
+          }
+
+          FAILED="$RUNNER_TEMP/failed-checks.md"
+          : > "$FAILED"
+          note_failure() {
+            if [ "$2" = "failure" ]; then
+              printf -- '- `%s`\n' "$1" >> "$FAILED"
+            fi
+          }
+          note_failure "cargo check --workspace" "$CHECK"
+          note_failure "cargo test -p ic-client" "$TEST_IC_CLIENT"
+          note_failure "cargo test -p smg --lib -- ic_consult ic_lookup" "$TEST_SMG_IC"
+          note_failure "cargo clippy -p ic-client --all-targets -- -D warnings" "$CLIPPY_IC_CLIENT"
+          note_failure "cargo clippy -p smg --lib -- -D warnings" "$CLIPPY_SMG"
+
+          SHORTSTAT=$(git diff --shortstat "refs/upstream-tags/$TAG..HEAD")
+          FILES=$(git diff --name-only "refs/upstream-tags/$TAG..HEAD")
+          NCOMMITS=$(git rev-list --count "refs/upstream-tags/$TAG..HEAD")
+
+          if [ -s "$FAILED" ]; then
+            HEADLINE="## Upstream sync: CHECKS FAILED on \`$TAG\`"
+            NOTE="The rebase onto \`$TAG\` was clean, but the fork does not build/pass on it. This is a code fix, not a rebase fix."
+          else
+            HEADLINE="## Upstream sync: rebase onto \`$TAG\` is green"
+            NOTE="The fork's commits replay cleanly onto \`$TAG\` and all scoped checks pass. Rebase \`main\` when convenient."
+          fi
+
+          {
+            echo "$HEADLINE"
+            echo
+            echo "$NOTE"
+            echo
+            if [ -s "$FAILED" ]; then
+              echo "### Failing checks"
+              echo
+              cat "$FAILED"
+              echo
+            fi
+            echo "### Checks"
+            echo
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| \`cargo check --workspace\` | $(icon "$CHECK") |"
+            echo "| \`cargo test -p ic-client\` | $(icon "$TEST_IC_CLIENT") |"
+            echo "| \`cargo test -p smg --lib -- ic_consult ic_lookup\` | $(icon "$TEST_SMG_IC") |"
+            echo "| \`cargo clippy -p ic-client --all-targets\` | $(icon "$CLIPPY_IC_CLIENT") |"
+            echo "| \`cargo clippy -p smg --lib\` | $(icon "$CLIPPY_SMG") |"
+            echo
+            echo "### Fork delta vs \`$TAG\`"
+            echo
+            echo "Commits: $NCOMMITS"
+            echo
+            echo '```'
+            echo "${SHORTSTAT:-no diff}"
+            echo '```'
+            echo
+            echo "<details><summary>Changed files</summary>"
+            echo
+            echo '```'
+            echo "$FILES"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

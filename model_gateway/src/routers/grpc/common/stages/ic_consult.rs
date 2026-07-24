@@ -151,17 +151,26 @@ impl IcConsultant {
 /// `available` worker slice — the same positional contract the internal
 /// `x-smg-target-worker` mechanism uses.
 ///
-/// ## Replica-identity seam — KNOWN OPEN PROBLEM (stable identity is a separate ticket)
+/// ## Replica-identity seam
 ///
-/// IC returns an engine-defined `replica_id`; SMG workers are keyed by URL. No
-/// stable identity contract exists between the two yet. Until it does, this
-/// matches `replica_id` against, in order:
-///   1. the worker URL (exact), then
-///   2. a `replica_id` worker label (exact),
-/// walking the ranked list best-first and returning the first replica that maps
-/// to a worker in the `available` slice. `None` (no match) means "omit the
-/// target" so the caller falls back to its policy. This function is the single
-/// place to swap in the real identity mapping when the contract lands.
+/// IC returns an engine-defined `replica_id`; SMG workers are keyed by URL. To
+/// obey a hint we match `replica_id` against a worker by, in order:
+///   1. the worker URL (exact),
+///   2. an explicit `replica_id` worker label (exact), then
+///   3. the leading host label of the worker URL.
+///
+/// Rule 3 is the identity contract with the cache plane. When engines are
+/// addressed by per-pod DNS — a headless Service / StatefulSet, so replica `i`
+/// has a URL like `grpc://<pod-name>.<svc>.<ns>.svc.cluster.local:<port>` — that
+/// leading label IS the pod name, which is exactly what the Inference Cache
+/// subscriber advertises as its `replica_id` (`--replica-id=$(POD_NAME)`). So a
+/// composition layer that addresses workers per-pod gets obeyed routing with no
+/// extra identity plumbing; rules 1–2 remain for callers that key identity on the
+/// full URL or set an explicit label.
+///
+/// Walks the ranked list best-first, returning the first replica that maps to a
+/// worker in `available`. `None` (no match) means "omit the target" so the caller
+/// falls back to its policy.
 pub(crate) fn resolve_replica_to_available_index(
     ranked: &[RankedReplica],
     available: &[Arc<dyn Worker>],
@@ -173,18 +182,47 @@ pub(crate) fn resolve_replica_to_available_index(
     })
 }
 
-/// Whether `worker` is the target named by `replica_id` under the current
-/// (best-effort) identity seam: exact URL, else a matching `replica_id` label.
+/// Whether `worker` is the target named by `replica_id`: exact URL, else an
+/// explicit `replica_id` label, else the leading host label of the worker URL
+/// (the per-pod-DNS pod name the cache subscriber reports). See
+/// [`resolve_replica_to_available_index`] for the identity contract.
 fn worker_matches_replica(worker: &Arc<dyn Worker>, replica_id: &str) -> bool {
-    if worker.url() == replica_id {
+    let url = worker.url();
+    if url == replica_id {
         return true;
     }
-    worker
+    if worker
         .metadata()
         .spec
         .labels
         .get("replica_id")
         .is_some_and(|label| label == replica_id)
+    {
+        return true;
+    }
+    host_leading_label(url).is_some_and(|label| label == replica_id)
+}
+
+/// The leading DNS label of a worker URL's host, e.g.
+/// `grpc://pod-0.svc.ns.svc.cluster.local:9000` -> `pod-0`. With per-pod-DNS
+/// addressing this label is the engine pod name — the cache subscriber's
+/// `replica_id`. Returns `None` for an IPv6-literal host (bracketed) or an empty
+/// label; an IPv4 host yields its first octet, which is harmless as a last-resort
+/// match since IC never reports a bare octet as a `replica_id`.
+fn host_leading_label(url: &str) -> Option<&str> {
+    // Drop any scheme ("grpc://", "http://", ...) then the path/query/fragment,
+    // leaving the authority (host[:port]).
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    if authority.starts_with('[') {
+        return None; // IPv6 literal has no DNS label
+    }
+    // The leading DNS label ends at the first '.' (domain) or ':' (port).
+    let label = authority.split(['.', ':']).next().unwrap_or(authority);
+    (!label.is_empty()).then_some(label)
 }
 
 #[cfg(test)]
@@ -267,6 +305,41 @@ mod tests {
             resolve_replica_to_available_index(&hint, &available),
             Some(1)
         );
+    }
+
+    #[test]
+    fn matches_by_host_leading_label() {
+        // Per-pod DNS addressing: the URL's leading host label is the engine pod
+        // name that IC reports as replica_id, so no explicit label is needed.
+        let available = vec![
+            worker("grpc://qwen3-engine-0.qwen3-engine.ns.svc.cluster.local:9000"),
+            worker("grpc://qwen3-engine-1.qwen3-engine.ns.svc.cluster.local:9000"),
+        ];
+        let hint = ranked(&["qwen3-engine-1"]);
+        assert_eq!(
+            resolve_replica_to_available_index(&hint, &available),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn host_leading_label_does_not_false_match_ip_worker() {
+        // A pod-name hint must not resolve to an IP-addressed worker.
+        let available = vec![worker("grpc://10.0.0.1:9000")];
+        let hint = ranked(&["qwen3-engine-0"]);
+        assert_eq!(resolve_replica_to_available_index(&hint, &available), None);
+    }
+
+    #[test]
+    fn host_leading_label_extraction() {
+        assert_eq!(
+            host_leading_label("grpc://pod-0.svc.ns.svc.cluster.local:9000"),
+            Some("pod-0")
+        );
+        assert_eq!(host_leading_label("http://w1:8000"), Some("w1"));
+        assert_eq!(host_leading_label("bare-host:9000"), Some("bare-host"));
+        assert_eq!(host_leading_label("grpc://[::1]:9000"), None); // IPv6 literal
+        assert_eq!(host_leading_label("grpc://"), None); // empty authority
     }
 
     #[test]

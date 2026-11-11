@@ -14,7 +14,145 @@ use crate::common::{
 
 #[cfg(test)]
 mod health_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use openai_protocol::worker::WorkerStatus;
+    use smg::{
+        config::RoutingMode,
+        worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker},
+    };
+
     use super::*;
+
+    async fn readiness_status(ctx: &AppTestContext) -> (StatusCode, serde_json::Value) {
+        let response = ctx
+            .create_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/readiness")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_readiness_tracks_circuit_availability_and_recovery() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:1")
+                .status(WorkerStatus::Ready)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    timeout_duration: Duration::from_millis(200),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        ctx.app_context.worker_registry.register(worker.clone());
+        assert_eq!(readiness_status(&ctx).await.0, StatusCode::OK);
+
+        worker.record_outcome(503);
+        assert!(worker.is_healthy());
+        assert!(!worker.is_available());
+        let (status, body) = readiness_status(&ctx).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["healthy_workers"], 1);
+        assert_eq!(body["available_workers"], 0);
+
+        // Router liveness stays independent of backend availability.
+        let response = ctx
+            .create_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Half-open permits traffic again; readiness must allow recovery even
+        // when no client requests arrive while the pod is out of endpoints.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(readiness_status(&ctx).await.0, StatusCode::OK);
+        worker.set_status(WorkerStatus::NotReady);
+        assert_eq!(
+            readiness_status(&ctx).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_readiness_with_an_available_peer() {
+        let ctx = AppTestContext::new(vec![]).await;
+        for port in [1, 2] {
+            let worker = Arc::new(
+                BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                    .status(WorkerStatus::Ready)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            if port == 1 {
+                worker.record_outcome(503);
+            }
+            ctx.app_context.worker_registry.register(worker);
+        }
+        let (status, body) = readiness_status(&ctx).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["available_workers"], 1);
+        assert_eq!(body["healthy_workers"], 2);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_readiness_requires_available_prefill_and_decode() {
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .build_unchecked();
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        for worker_type in [
+            smg::worker::WorkerType::Prefill,
+            smg::worker::WorkerType::Decode,
+        ] {
+            let worker = Arc::new(
+                BasicWorkerBuilder::new(format!("http://{worker_type:?}:1"))
+                    .worker_type(worker_type.clone())
+                    .status(WorkerStatus::Ready)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            if matches!(worker_type, smg::worker::WorkerType::Decode) {
+                worker.record_outcome(503);
+            }
+            ctx.app_context.worker_registry.register(worker);
+        }
+        assert_eq!(
+            readiness_status(&ctx).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ctx.shutdown().await;
+    }
 
     #[tokio::test]
     async fn test_liveness_endpoint() {

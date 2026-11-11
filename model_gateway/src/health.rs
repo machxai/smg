@@ -22,7 +22,8 @@
 //!    mutations that bypass the registry broadcast — `set_status()` called
 //!    directly by `ActivateWorkersStep`, the mesh inbound health refresh in
 //!    `WorkerRegistry::on_remote_worker_state`, FFI bindings — and tokenizer
-//!    registrations, which emit no worker event at all.
+//!    registrations and circuit-breaker transitions, which emit no worker
+//!    event at all.
 //!
 //! 2. **Dedicated probe listener.** When `--health-check-port` (config
 //!    `health_check_port`) is set, `/liveness`, `/readiness`, and `/health`
@@ -72,17 +73,17 @@ use crate::{
 /// How often the maintainer re-derives readiness from the registry even
 /// without worker events. This bounds the staleness of mutations that
 /// bypass the `WorkerRegistry` broadcast (direct `set_status()` callers,
-/// tokenizer registrations) and is deliberately shorter than the metrics
-/// collectors' 3s checkpoint: readiness gates traffic, so a flip should
-/// land within one probe interval.
+/// tokenizer registrations, circuit-breaker transitions) and is deliberately
+/// shorter than the metrics collectors' 3s checkpoint: readiness gates
+/// traffic, so a flip should land within one probe interval.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Result of one readiness evaluation. Field semantics are identical to the
-/// values the `/readiness` handler used to compute inline per probe.
+/// Result of one readiness evaluation, including both engine health and
+/// availability for worker selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadinessSnapshot {
-    /// Per-mode worker presence: any healthy worker (IGW or single-pool
-    /// modes), or at least one healthy prefill AND one healthy decode
+    /// Per-mode worker presence: any available worker (IGW or single-pool
+    /// modes), or at least one available prefill AND one available decode
     /// worker in PrefillDecode mode.
     pub workers_ready: bool,
     /// Tokenizer-autoload gate: every healthy gRPC worker's tokenizer is
@@ -91,6 +92,8 @@ pub struct ReadinessSnapshot {
     pub tokenizers_ready: bool,
     /// Number of healthy workers (reported in the ready response body).
     pub healthy_workers: usize,
+    /// Healthy workers whose circuit breaker permits worker selection.
+    pub available_workers: usize,
     /// Total number of registered workers (reported in the ready response
     /// body).
     pub total_workers: usize,
@@ -131,9 +134,8 @@ impl ProbeState {
 
     /// Re-derive the readiness snapshot from live state.
     ///
-    /// This is the exact computation the `/readiness` handler used to run
-    /// inline per probe (see `server::readiness` before #1694), relocated
-    /// onto the maintainer task so probes become O(1) reads.
+    /// Evaluates worker availability and tokenizer readiness on the
+    /// maintainer task so probes remain O(1) reads.
     pub fn recompute(
         &self,
         worker_registry: &WorkerRegistry,
@@ -155,36 +157,40 @@ impl ProbeState {
     ) {
         let workers = worker_registry.get_all();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+        // Match worker selection: a healthy engine behind an open circuit
+        // cannot serve requests. Keep the O(1) probe path by computing this
+        // in the maintainer, whose checkpoint also observes half-open recovery.
+        let available_workers: Vec<_> = workers.iter().filter(|w| w.is_available()).collect();
 
         let workers_ready = if router_config.enable_igw {
-            !healthy_workers.is_empty()
+            !available_workers.is_empty()
         } else {
             match &router_config.mode {
                 RoutingMode::PrefillDecode { .. } => {
-                    let has_prefill = healthy_workers
+                    let has_prefill = available_workers
                         .iter()
                         .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
-                    let has_decode = healthy_workers
+                    let has_decode = available_workers
                         .iter()
                         .any(|w| matches!(w.worker_type(), WorkerType::Decode));
                     has_prefill && has_decode
                 }
                 RoutingMode::EncodePrefillDecode { .. } => {
-                    let has_encode = healthy_workers
+                    let has_encode = available_workers
                         .iter()
                         .any(|w| matches!(w.worker_type(), WorkerType::Encode));
-                    let has_prefill = healthy_workers
+                    let has_prefill = available_workers
                         .iter()
                         .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
-                    let has_decode = healthy_workers
+                    let has_decode = available_workers
                         .iter()
                         .any(|w| matches!(w.worker_type(), WorkerType::Decode));
                     has_encode && has_prefill && has_decode
                 }
-                RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
-                RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
-                RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
-                RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
+                RoutingMode::Regular { .. } => !available_workers.is_empty(),
+                RoutingMode::OpenAI { .. } => !available_workers.is_empty(),
+                RoutingMode::Anthropic { .. } => !available_workers.is_empty(),
+                RoutingMode::Gemini { .. } => !available_workers.is_empty(),
             }
         };
 
@@ -207,6 +213,7 @@ impl ProbeState {
             workers_ready,
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
+            available_workers: available_workers.len(),
             total_workers: workers.len(),
         }));
     }
@@ -214,8 +221,8 @@ impl ProbeState {
     /// Build the `/readiness` response from cached state only: one drain
     /// flag load plus one snapshot pointer load — no registry access.
     ///
-    /// Response bodies are byte-identical to the previous inline handler,
-    /// with one addition: while draining, readiness reports not-ready with
+    /// Responses distinguish healthy engines from workers available for
+    /// routing. While draining, readiness reports not-ready with
     /// reason `"draining"` so load balancers stop routing new connections
     /// during shutdown (liveness intentionally stays OK — see module docs).
     pub fn readiness_response(&self) -> Response {
@@ -237,6 +244,7 @@ impl ProbeState {
                 Json(json!({
                     "status": "ready",
                     "healthy_workers": snapshot.healthy_workers,
+                    "available_workers": snapshot.available_workers,
                     "total_workers": snapshot.total_workers
                 })),
             )
@@ -245,13 +253,16 @@ impl ProbeState {
             let reason = if snapshot.workers_ready {
                 "tokenizer not yet registered"
             } else {
-                "insufficient healthy workers"
+                "insufficient available workers"
             };
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "status": "not ready",
-                    "reason": reason
+                    "reason": reason,
+                    "healthy_workers": snapshot.healthy_workers,
+                    "available_workers": snapshot.available_workers,
+                    "total_workers": snapshot.total_workers
                 })),
             )
                 .into_response()
@@ -773,7 +784,10 @@ mod tests {
         // Initial snapshot: not ready.
         let (status, body) = get_probe(&router, "/readiness").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.contains("insufficient healthy workers"), "got: {body}");
+        assert!(
+            body.contains("insufficient available workers"),
+            "got: {body}"
+        );
 
         // Liveness and health are always OK.
         let (status, body) = get_probe(&router, "/liveness").await;
@@ -791,6 +805,7 @@ mod tests {
         let (status, body) = get_probe(&router, "/readiness").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"healthy_workers\":1"), "got: {body}");
+        assert!(body.contains("\"available_workers\":1"), "got: {body}");
         assert!(body.contains("\"total_workers\":1"), "got: {body}");
 
         // Drain flips readiness on this listener too; liveness stays OK.
@@ -873,6 +888,58 @@ mod tests {
             "maintainer did not pick up the Registered event"
         );
 
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn maintainer_observes_circuit_open_and_half_open_without_worker_events() {
+        let state = probe_state();
+        let registry = Arc::new(WorkerRegistry::new());
+        let tokenizers = Arc::new(TokenizerRegistry::new());
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8080")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    timeout_duration: Duration::from_millis(1500),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(worker.clone()).unwrap();
+        let handle = spawn_readiness_maintainer(
+            state.clone(),
+            registry.clone(),
+            tokenizers.clone(),
+            regular_config(),
+        );
+        assert!(state.readiness().workers_ready);
+
+        worker.record_outcome(503);
+        assert!(worker.is_healthy());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.readiness().workers_ready {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("checkpoint must observe circuit opening");
+        assert_eq!(state.readiness().healthy_workers, 1);
+        assert_eq!(state.readiness().available_workers, 0);
+
+        // There are no new worker events or requests to drive recovery while
+        // the pod is removed from endpoints. The checkpoint must allow it.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !state.readiness().workers_ready {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("checkpoint must observe half-open recovery");
+        assert_eq!(state.readiness().available_workers, 1);
         handle.abort();
     }
 
